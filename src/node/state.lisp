@@ -25,7 +25,6 @@
   (wallet-manager nil)
   (fee-estimator nil)  ; Fee rate estimator for estimatesmartfee
   (address-book nil)  ; Persistent peer address database
-  (recent-rejects nil)  ; Recently rejected transaction filter (DoS protection)
   (peers '() :type list)
   (running nil :type boolean)
   (log-level :info :type keyword)

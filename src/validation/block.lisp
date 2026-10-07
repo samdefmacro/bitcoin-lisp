@@ -2931,36 +2931,18 @@ store-undo-data (the connect path, which does the height bookkeeping) caches."
                 (:failed (values nil nil))
                 (t (values (%load-undo-legacy block-hash) t))))))))
 
-;;;; Recently-confirmed transactions + most-recent-block tx set
+;;;; The most-recent-block tx set
 ;;;;
-;;;; Two small tip-following structures Core keeps for tx relay, maintained
-;;;; here because every block-connect path (IBD, relay, compact blocks,
-;;;; reorg reconnect) funnels through this file:
-;;;;
-;;;;  - The recent-confirmed filter (Core m_lazy_recent_confirmed_transactions,
-;;;;    txdownloadman_impl.h:120-128, a CRollingBloomFilter{48000, 0.000001}):
-;;;;    txids AND wtxids of txs confirmed in recent blocks, so freshly-mined
-;;;;    txs aren't re-requested or re-processed when a slower peer announces
-;;;;    them (AlreadyHaveTx, txdownloadman_impl.cpp:144). Reset on block
-;;;;    DISCONNECT (reorg) so previously-confirmed txs can relay again
-;;;;    (BlockDisconnected, txdownloadman_impl.cpp:112-123).
-;;;;
-;;;;  - The most-recent-block tx map (Core m_most_recent_block_txs,
-;;;;    net_processing.cpp:869, rebuilt in NewPoWValidBlock:2121-2132): the
-;;;;    newest block's txs keyed by txid and wtxid, so a getdata for a
-;;;;    just-confirmed tx is still served even though it left the mempool
-;;;;    (FindTxForGetData's second source, net_processing.cpp:2507-2514).
-;;;;
-;;;;  - The RECONSIDERABLE rejects filter (Core
-;;;;    m_lazy_recent_rejects_reconsiderable, txdownloadman_impl.h:83-95):
-;;;;    the second of Core's two reject filters, kept here for the same
-;;;;    reason — it is reset on every active tip change, and that reset
-;;;;    happens in this file.
-
-(defvar *recent-confirmed-txs* (bl:make-rejects-filter 48000)
-  "Bounded rolling set of recently-confirmed txids/wtxids (Core
-m_lazy_recent_confirmed_transactions). Reuses the recent-rejects ring
-structure, sized like Core: 48,000 entries covers ~a couple hours of blocks.")
+;;;; Core's m_most_recent_block_txs (net_processing.cpp:869, rebuilt in
+;;;; NewPoWValidBlock:2121-2132): the newest block's txs keyed by txid and
+;;;; wtxid, so a getdata for a just-confirmed tx is still served even though it
+;;;; left the mempool (FindTxForGetData's second source,
+;;;; net_processing.cpp:2507-2514). Maintained here because every
+;;;; block-connect path (IBD, relay, compact blocks, reorg reconnect) funnels
+;;;; through this file. The tx-download filters that follow the tip -- recent
+;;;; rejects, reconsiderable rejects, recently confirmed -- are the
+;;;; TxDownloadManager's (src/networking/txdownloadman.lisp), driven from the
+;;;; validation interface.
 
 (defvar *most-recent-block-txs* nil
   "Hash-table (octet test) mapping the most recent connected block's tx ids —
@@ -2992,75 +2974,14 @@ caller answers from disk instead."
           (setf *most-recent-cmpctblock*
                 (bl.ser:make-cmpctblock-message (cdr recent)))))))
 
-(defun recently-confirmed-p (hash)
-  "T if HASH (txid or wtxid) was confirmed in a recent block."
-  (and (bl:recent-reject-p *recent-confirmed-txs* hash) t))
-
 (defun most-recent-block-tx (hash)
   "The most recent block's transaction with txid or wtxid HASH, or NIL."
   (and *most-recent-block-txs*
        (gethash hash *most-recent-block-txs*)))
 
-(defun reset-recent-confirmed ()
-  "Empty the recent-confirmed filter — on block disconnect (Core
-BlockDisconnected: a reorg may return confirmed txs to circulation, and the
-filter would otherwise block their relay) and at node start."
-  (bl:clear-recent-rejects *recent-confirmed-txs*))
-
-;;;; The reconsiderable rejects filter (Core's SECOND rejects filter)
-
-(defvar *recent-rejects-reconsiderable* (bl:make-rejects-filter 50000)
-  "Bounded rolling set of wtxids — and 1p1c package hashes — whose last
-failure was TX_RECONSIDERABLE: a policy failure a DIFFERENT package could
-still overcome. Core keeps this as a filter SEPARATE from the main rejects
-filter (m_lazy_recent_rejects_reconsiderable, txdownloadman_impl.cpp:
-454-466) precisely so those transactions are not black-holed: an entry here
-means \"do not download or submit this by ITSELF again\", not \"never accept
-this\" — it may still ride in as part of a package.
-
-Core routes both fee-floor failures here (CheckFeeRate, validation.cpp:
-703-711), the RBF fee/diagram failures (:1010, :1028) and \"mempool full\"
-(:1401). Everything else keeps going to the main filter.
-
-Node-global, like *RECENT-CONFIRMED-TXS* above: the validation layer loads
-before networking, and the active-tip-change reset lives in this file.")
-
-(defun reconsiderable-reject-p (hash)
-  "T if HASH (a wtxid, or a 1p1c package hash) failed reconsiderably and so
-must not be submitted on its own again (Core
-RecentRejectsReconsiderableFilter().contains)."
-  (and (bl:recent-reject-p *recent-rejects-reconsiderable* hash) t))
-
-(defun add-reconsiderable-reject (hash)
-  "Record HASH as a reconsiderable failure (Core
-RecentRejectsReconsiderableFilter().insert)."
-  (bl:add-recent-reject *recent-rejects-reconsiderable* hash))
-
-(defun clear-reconsiderable-rejects ()
-  "Empty the reconsiderable rejects filter. Core resets it beside the main
-rejects filter on every active tip change (ActiveTipChange,
-txdownloadman_impl.cpp:91-95): a new block changes both the fee floor and
-which parents exist, so every cached fee failure is stale."
-  (bl:clear-recent-rejects *recent-rejects-reconsiderable*))
-
-(defun note-block-txs-confirmed (block)
-  "Add every transaction of BLOCK, txid and distinct wtxid, to the
-recent-confirmed filter (Core TxDownloadManagerImpl::BlockConnected,
-txdownloadman_impl.cpp:98-110). The networking layer's BlockConnected
-subscriber (TX-REQUEST-BLOCK-CONNECTED) calls it, and -- as Core's
-PeerManagerImpl::BlockConnected does -- only outside initial block download
-and never for a targeted chainstate (net_processing.cpp:2086-2092)."
-  (dolist (tx (coerce (bl.ser:bitcoin-block-transactions block) 'list))
-    (let ((txid (bl.ser:transaction-hash tx))
-          (wtxid (bl.ser:transaction-wtxid tx)))
-      (bl:add-recent-reject *recent-confirmed-txs* txid)
-      (unless (equalp wtxid txid)
-        (bl:add-recent-reject *recent-confirmed-txs* wtxid)))))
-
 (defun note-block-connected (block)
   "Record BLOCK as the new most-recent block: rebuild the getdata-servable
-tx map (Core NewPoWValidBlock's most_recent_block_txs rebuild). The
-recent-confirmed filter is NOTE-BLOCK-TXS-CONFIRMED's, which is gated on IBD.
+tx map (Core NewPoWValidBlock's most_recent_block_txs rebuild).
 
 The map is keyed by txid and wtxid, so it takes the octet test: under EQUALP
 its rebuild -- two inserts per transaction, every block of IBD -- was 2.0% of
@@ -3111,7 +3032,7 @@ zmq.lisp), as Core's do by ChainstateRole."
 ;;;; Block connection
 
 (defun connect-block (block chain-state block-store utxo-set
-                      &key recent-rejects mempool)
+                      &key mempool)
   "Connect a validated block to the chain.
 Updates chain state and UTXO set.
 Every enabled index folds the block in through the connect hook
@@ -3244,20 +3165,18 @@ Handles chain reorganizations when a competing chain has more work."
                (bl.mp:mempool-remove-for-block mempool block)))
              ;; Tx-relay tip bookkeeping (outside the critical section):
              ;; expire stale mempool entries once per block (Core expire-on-
-             ;; block); erase orphans included in/conflicted by this block
-             ;; (Core BlockConnected -> TxOrphanage::EraseForBlock); record the
-             ;; block's txids/wtxids as recently confirmed and getdata-servable
-             ;; (Core m_lazy_recent_confirmed_transactions +
-             ;; m_most_recent_block_txs). A TARGETED chainstate — the assumeutxo
-             ;; historical chainstate re-deriving old history — must not touch
-             ;; these: its "tip" blocks are ancient, and Core only wires the
-             ;; validation-interface tx-relay callbacks to the ACTIVE chainstate
-             ;; (BlockConnected checks role, net_processing.cpp:2149-2157).
+             ;; block); record the block's txids/wtxids as getdata-servable
+             ;; (Core m_most_recent_block_txs). The orphanage and the
+             ;; recently-confirmed filter are the TxDownloadManager's, which
+             ;; hears of the block through BlockConnected below. A TARGETED
+             ;; chainstate — the assumeutxo historical chainstate re-deriving
+             ;; old history — must not touch these: its "tip" blocks are
+             ;; ancient, and Core only wires the validation-interface tx-relay
+             ;; callbacks to the ACTIVE chainstate (BlockConnected checks role,
+             ;; net_processing.cpp:2149-2157).
              (unless (historical-chainstate-p chain-state)
                (when mempool
-                 (bl.mp:mempool-expire mempool)
-                 (bl.mp:orphan-erase-for-block
-                  (bl.mp:mempool-orphan-pool mempool) block))
+                 (bl.mp:mempool-expire mempool))
                (note-block-connected block)
                ;; The check that ends every activation step, before its
                ;; BlockConnected signals (validation.cpp:3300).
@@ -3276,14 +3195,13 @@ Handles chain reorganizations when a competing chain has more work."
              ;; (validation.cpp:3302): the warning must CLEAR once our own chain
              ;; has outgrown the invalid one again, not only be raised.
              (%check-fork-warning-conditions chain-state)
-             ;; Core resets the recent-rejects filter on EVERY active tip change,
-             ;; not just reorgs: cached failures (non-final, too-low-fee, missing
-             ;; inputs) can become valid at the next block (ActiveTipChange,
-             ;; net_processing.cpp:2045-2059 -> txdownloadman_impl.cpp:92-96
-             ;; RecentRejectsFilter().reset()). Previously only the reorg path
-             ;; cleared it. ActiveTipChange resets BOTH filters.
-             (bl:clear-recent-rejects recent-rejects)
-             (clear-reconsiderable-rejects)
+             ;; Core's ActiveTipChange after every activation step of the
+             ;; ACTIVE chainstate (validation.cpp:3472-3475): the tx-download
+             ;; side resets its rejection filters there, because a cached
+             ;; failure (non-final, too-low-fee) can become valid at the next
+             ;; block.
+             (unless (historical-chainstate-p chain-state)
+               (bl.vi:notify-active-tip-change chain-state))
              ;; Automatic block pruning after connecting a new block; each
              ;; pruned block's undo file goes with it.
              (when (bl:automatic-pruning-p)
@@ -3302,7 +3220,6 @@ Handles chain reorganizations when a competing chain has more work."
              (multiple-value-list
               (perform-reorg chain-state block-store utxo-set
                              current-best-entry entry
-                             :recent-rejects recent-rejects
                              :mempool mempool)))
             ;; New block is on a weaker chain: it is stored, nothing more.
             (t nil)))))
@@ -4044,7 +3961,7 @@ deferred to %REORG-COMMIT so a rolled-back reorg leaves nothing behind."
   ;; (higher) spends O, disconnecting A first leaves O re-added by
   ;; B's undo data — see coin-view-disconnect-block for the analogous
   ;; within-block case. Side effects (txindex / mempool re-add /
-  ;; recent-rejects) are deferred to PHASE C so a rolled-back reorg
+  ;; tip-change signals) are deferred to PHASE C so a rolled-back reorg
   ;; leaves them untouched.
   (dolist (entry (reorg-to-disconnect r))
     ;; Cooperative stop (see the phase-3b section comment above). At the TOP
@@ -4254,7 +4171,7 @@ when it was rolled back."
 
     (values t nil)))
 
-(defun %reorg-commit (r chain-state utxo-set mempool recent-rejects
+(defun %reorg-commit (r chain-state utxo-set mempool
                       &key max-readd-blocks)
   "PHASE C of a reorg: the observable side effects, committed only once the
 whole fork has validated and applied -- wallet and ZMQ notifications, the
@@ -4273,14 +4190,6 @@ relay filters."
 ;; PHASE C — commit side effects, only now the whole fork is valid
 ;; and applied. Oldest-to-newest for chain-order indexing.
 ;;
-;; Blocks were disconnected: reset the recent-confirmed filter so
-;; previously-confirmed txs returning to circulation can relay
-;; again (Core BlockDisconnected -> RecentConfirmedTransactions
-;; Filter().reset(), txdownloadman_impl.cpp:112-123). Deferred to
-;; the commit phase alongside the other side effects: a rolled-back
-;; reorg never disconnected anything observably.
-(unless (historical-chainstate-p chain-state)
-  (reset-recent-confirmed))
 ;; Core fires BlockDisconnected per DisconnectTip — tip-first, before
 ;; the fork's BlockConnected signals — and the wallet, ZMQ and the
 ;; spender index subscribe to it. Deferred here with the other side
@@ -4304,9 +4213,7 @@ relay filters."
     (let ((hash (bl.store:block-index-entry-hash entry)))
       (unless (historical-chainstate-p chain-state)
         (when mempool
-          (bl.mp:mempool-remove-for-block mempool block)
-          (bl.mp:orphan-erase-for-block
-           (bl.mp:mempool-orphan-pool mempool) block))
+          (bl.mp:mempool-remove-for-block mempool block))
         ;; Each reconnected block counts as connected for the tx-relay
         ;; tip structures; the LAST one leaves the map at the new tip.
         (note-block-connected block))
@@ -4326,9 +4233,10 @@ relay filters."
 ;; upserts above; stale-branch-only txs keep resolving through the
 ;; still-stored stale block (removing them here used to leave re-mined
 ;; txs UNINDEXED, since the old txindex-add skipped existing txids).
-;; Reorg may change tx validity — clear both rejects caches.
-(bl:clear-recent-rejects recent-rejects)
-(clear-reconsiderable-rejects)
+;; The tip changed: Core's ActiveTipChange (validation.cpp:3472-3475), on
+;; which the tx-download side resets both rejection filters.
+(unless (historical-chainstate-p chain-state)
+  (bl.vi:notify-active-tip-change chain-state))
 ;; Re-add disconnected-block txs (best-effort, against the new tip),
 ;; parents before children. Txs re-confirmed or invalidated by the
 ;; new chain are dropped by re-validation.
@@ -4405,7 +4313,7 @@ feature_block.py:248 waited out its timeout for the disconnect."
   (and (consp detail) (consp (first detail))))
 
 (defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
-                      &key recent-rejects mempool skip-scripts
+                      &key mempool skip-scripts
                            max-readd-blocks (abort-on-disconnect-failure t))
   "Perform a chain reorganization from OLD-TIP to NEW-TIP.
 Disconnects blocks back to the fork point, then connects blocks on the new chain.
@@ -4433,7 +4341,7 @@ ABORT-ON-DISCONNECT-FAILURE, T by default, makes a disconnect that cannot run
 (validation.cpp:3234-3243); InvalidateBlock passes NIL, because Core's
 InvalidateBlock returns false on a failed DisconnectTip and nothing more
 (validation.cpp:3614-3622).
-Side effects (indexes / mempool / recent-rejects) are applied
+Side effects (indexes / mempool / tip-change signals) are applied
 only after the whole fork validates, so a rolled-back reorg leaves them untouched.
 
 A stop request (shutdown / sync pause) TRUNCATES the reorg at the next block
@@ -4586,7 +4494,7 @@ comment above."
             (unless ok (return-from perform-reorg (values nil error))))
 
           (%reorg-commit r chain-state utxo-set mempool
-                         recent-rejects :max-readd-blocks max-readd-blocks))))))
+                         :max-readd-blocks max-readd-blocks))))))
 
 ;;;; Chain-control helpers (invalidateblock / reconsiderblock)
 ;;;;
@@ -4732,7 +4640,7 @@ TARGET's chain, so a step is a real move toward it and never sideways."
           (or e target)))))
 
 (defun activate-best-chain (chain-state block-store utxo-set
-                            &key recent-rejects mempool)
+                            &key mempool)
   "Reorganize onto the most-work fully-downloaded valid chain when it beats the
 active tip. Returns (values switched-p missing-blocks), where MISSING-BLOCKS is
 perform-reorg's re-queue list if a switch was refused for want of block bodies.
@@ -4774,7 +4682,7 @@ backstop against a candidate that reorgs away and reappears."
             (return))
           (multiple-value-bind (ok detail)
               (perform-reorg chain-state block-store utxo-set tip target
-                             :recent-rejects recent-rejects :mempool mempool)
+                             :mempool mempool)
             (cond
               (ok
                (setf switched t)
@@ -4846,7 +4754,7 @@ interface_zmq.py:308 expects the node to go back to."
                     (lambda (e) (bl.store:entry-better-p e tip)))))
 
 (defun %activate-best-valid-chain (chain-state block-store utxo-set
-                                   &key recent-rejects mempool)
+                                   &key mempool)
   "Core ActivateBestChain, run after a chain-control RPC has changed which
 blocks are eligible: switch to the most-work valid tip whose blocks back to
 the active chain we hold (%BEST-REACHABLE-TIP), if it outweighs the active one. Returns (VALUES T NIL) -- including when
@@ -4861,14 +4769,14 @@ there is nothing better to switch to -- or (VALUES NIL REASON)."
         ;; success for a switch that did not happen.
         (multiple-value-bind (ok detail)
             (perform-reorg chain-state block-store utxo-set tip target
-                           :recent-rejects recent-rejects :mempool mempool)
+                           :mempool mempool)
           (if ok
               (values t nil)
               (values nil (if (eq detail :interrupted) :interrupted :reorg-failed))))
         (values t nil))))
 
 (defun invalidate-block (chain-state block-store utxo-set block-hash
-                         &key recent-rejects mempool)
+                         &key mempool)
   "Mark BLOCK-HASH and all its descendants :invalid, reorganizing the active
 chain back to BLOCK-HASH's parent if the active chain contained it, and then
 on to the best chain that is still valid. Returns (values t nil) on success,
@@ -4900,7 +4808,7 @@ on its OWN four-block chain; we left it at height 1."
            (when (and tip parent (block-descends-from-p tip entry))
              (multiple-value-bind (ok detail)
                  (perform-reorg chain-state block-store utxo-set tip parent
-                                :recent-rejects recent-rejects :mempool mempool
+                                :mempool mempool
                                 ;; Core InvalidateBlock's fAddToMempool
                                 ;; (validation.cpp:3621): only the ten blocks
                                 ;; nearest the old tip come back.
@@ -4922,11 +4830,10 @@ on its OWN four-block chain; we left it at height 1."
            (%mark-block-subtree-invalid chain-state entry)
            ;; Core ActivateBestChain (rpc/blockchain.cpp:1707-1709).
            (%activate-best-valid-chain chain-state block-store utxo-set
-                                       :recent-rejects recent-rejects
                                        :mempool mempool)))))))
 
 (defun reconsider-block (chain-state block-store utxo-set block-hash
-                         &key recent-rejects mempool)
+                         &key mempool)
   "Clear :invalid from BLOCK-HASH plus its ancestors and descendants -- each
 back at the validity level it had, a SCRIPTS-valid block :valid again (Core
 ResetBlockFailureFlags) -- then reorganize to the best valid chain if it now
@@ -4952,12 +4859,11 @@ outweighs the active tip. Returns
             ;; (rpc/blockchain.cpp:1749-1754) -- the same second step
             ;; invalidateblock takes.
             (%activate-best-valid-chain chain-state block-store utxo-set
-                                        :recent-rejects recent-rejects
                                         :mempool mempool))
           (values nil :block-not-found)))))
 
 (defun precious-block (chain-state block-store utxo-set block-hash
-                       &key recent-rejects mempool)
+                       &key mempool)
   "Treat BLOCK-HASH as preferred (Bitcoin Core preciousblock): if its chain has at
 least as much work as the active tip, give it the next NEGATIVE sequence id
 (Core PreciousBlock, validation.cpp:3522-3547) and, unless it already is the
@@ -4996,7 +4902,7 @@ is already the tip or weaker), (values nil reason) on failure."
              (t
               (multiple-value-bind (ok detail)
                   (perform-reorg chain-state block-store utxo-set tip entry
-                                 :recent-rejects recent-rejects :mempool mempool)
+                                 :mempool mempool)
                 (cond (ok (values t nil))
                       ((eq detail :interrupted) (values nil :interrupted))
                       (t (values nil :reorg-failed))))))))))))
@@ -5117,7 +5023,7 @@ waited for a block the node no longer knew."
       (%store-accepted-block-body block chain-state block-store :current-time now)))
 
 (defun %activate-best-after-refused-reorg (chain-state block-store utxo-set
-                                           recent-rejects mempool)
+                                           mempool)
   "ACTIVATE-BLOCK's pre-reorg toward a block was refused for want of fork
 bodies, but the index may hold a better tip than the active one that IS
 complete: Core's ProcessNewBlock ends in ActivateBestChain whatever this
@@ -5126,11 +5032,10 @@ incomplete candidate for the next one. feature_chain_tiebreaks.py:94 hands B7
 (parent B3 missing) to this arm right after B4 completed B9, and reads B9 as
 the tip."
   (activate-best-chain chain-state block-store utxo-set
-                       :recent-rejects recent-rejects
                        :mempool mempool))
 
 (defun activate-block (block chain-state block-store utxo-set
-                       &key current-time skip-scripts recent-rejects mempool)
+                       &key current-time skip-scripts mempool)
   "Validate and activate BLOCK. Three cases:
 
   1. BLOCK's parent IS the current best tip — validate then connect
@@ -5157,11 +5062,10 @@ can neither wedge on an equal-work sibling nor advance past the base."
   (with-chainstate-mutex (activate-block)
     (%activate-block block chain-state block-store utxo-set
                      :current-time current-time :skip-scripts skip-scripts
-                     :recent-rejects recent-rejects
                      :mempool mempool)))
 
 (defun %activate-block (block chain-state block-store utxo-set
-                        &key current-time skip-scripts recent-rejects mempool)
+                        &key current-time skip-scripts mempool)
   "ACTIVATE-BLOCK's body, run holding the chainstate mutex."
   (let* ((header (bl.ser:bitcoin-block-header block))
          (prev-hash (bl.ser:block-header-prev-block header))
@@ -5192,7 +5096,6 @@ can neither wedge on an equal-work sibling nor advance past the base."
            (if valid
                (progn
                  (connect-block block chain-state block-store utxo-set
-                                :recent-rejects recent-rejects
                                 :mempool mempool)
                  (%maybe-note-target-reached chain-state)
                  (values t nil))
@@ -5242,7 +5145,6 @@ can neither wedge on an equal-work sibling nor advance past the base."
             (multiple-value-bind (reorg-ok detail)
                 (perform-reorg chain-state block-store utxo-set
                                current-best-entry prev-entry
-                               :recent-rejects recent-rejects
                                :mempool mempool
                                :skip-scripts skip-scripts)
               (cond
@@ -5262,7 +5164,7 @@ can neither wedge on an equal-work sibling nor advance past the base."
                 ((and (null reorg-ok) detail)
                  ;; Stored above; ProcessNewBlock's closing ActivateBestChain.
                  (%activate-best-after-refused-reorg
-                  chain-state block-store utxo-set recent-rejects mempool)
+                  chain-state block-store utxo-set mempool)
                  (values nil :reorg-refused detail))
                 ;; Refused for another reason (no common ancestor). State
                 ;; unchanged.
@@ -5277,7 +5179,6 @@ can neither wedge on an equal-work sibling nor advance past the base."
                      (if valid
                          (progn
                            (connect-block block chain-state block-store utxo-set
-                                          :recent-rejects recent-rejects
                                           :mempool mempool)
                            (%maybe-note-target-reached chain-state)
                            (values t nil))
@@ -5308,7 +5209,6 @@ can neither wedge on an equal-work sibling nor advance past the base."
                              (multiple-value-bind (reverted revert-detail)
                                  (perform-reorg chain-state block-store utxo-set
                                                 fork-tip current-best-entry
-                                                :recent-rejects recent-rejects
                                                 :mempool mempool
                                                 :skip-scripts skip-scripts)
                                (cond

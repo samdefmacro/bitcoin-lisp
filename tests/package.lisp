@@ -52,6 +52,11 @@ it used to be defined in two of them, the later silently replacing the first."
 rejects filter"
   :in :bitcoin-lisp-tests)
 
+(def-suite :txdownloadman-tests
+  :description "Core's TxDownloadManager and the net_processing sites that
+drive it (src/networking/txdownloadman.lisp)"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :mining-tests
   :description "Tests for regtest support and mining RPCs"
   :in :bitcoin-lisp-tests)

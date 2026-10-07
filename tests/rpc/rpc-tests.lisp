@@ -9280,7 +9280,7 @@ The single announcer peer's id appears in \"from\"."
                                 :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
               :lock-time 0))
          (mempool (bl.rpc:rpc-get-mempool node))
-         (pool (bl.mp:mempool-orphan-pool mempool))
+         (pool (progn (bl.net:reset-txdownloadman mempool) (test-orphanage)))
          (txid-hex (bl.rpc:hash-to-hex
                     (bl.ser:transaction-hash tx))))
     (bl.mp:orphan-add pool tx peer)

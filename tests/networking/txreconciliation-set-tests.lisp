@@ -949,12 +949,13 @@ listener-socket): the dialler is the reconciliation initiator."
 (defun %rc-node-context (fundings peer)
   "One node: a chainstate, a coins view holding a 1 BTC P2SH(OP_TRUE) output
 for each of FUNDINGS, an empty mempool, and PEER as its only connection."
-  (let ((utxo (bl.store:make-utxo-set)))
+  (let ((utxo (bl.store:make-utxo-set))
+        (mempool (bl.mp:make-mempool)))
     (dolist (f fundings)
       (bl.store:add-utxo utxo f 0 100000000 (p2sh-optrue-script-pubkey) 1 :coinbase nil))
     (bl.ctx:make-node-context :chain-state (bl.store:make-chain-state :best-height 200)
-                              :utxo-set utxo :mempool (bl.mp:make-mempool)
-                              :recent-rejects (bl:make-rejects-filter 1000)
+                              :utxo-set utxo :mempool mempool
+                              :txdownloadman (bl.net:make-txdownload-manager :mempool mempool)
                               :peers (list peer))))
 
 (defun %rc-accept (ctx tx &key (relay t))
@@ -970,7 +971,7 @@ holds it for a reconciling peer. Returns its wtxid."
                    :chain-state (bl.ctx:node-context-chain-state ctx)
                    :utxo-set (bl.ctx:node-context-utxo-set ctx)
                    :mempool (bl.ctx:node-context-mempool ctx)
-                   :recent-rejects (bl.ctx:node-context-recent-rejects ctx))))
+                   :txdownloadman (bl.ctx:node-context-txdownloadman ctx))))
   (bl.ser:transaction-wtxid tx))
 
 (defun %rc-loopback-run (&key wrong-salt (rounds t) (seconds 12) (shared-count 10))
@@ -992,10 +993,9 @@ transactions either side announced -- none when the sketches cancelled them,
 all when a failed round fell back to flooding; :REGISTERED, whether the
 handshake registered both sides."
   (let ((bl:*tx-reconciliation* t)
-        (bl:*network* :regtest)
-        (bl.val:*recent-rejects-reconsiderable* (bl:make-rejects-filter 100)))
+        (bl:*network* :regtest))
     (with-tx-relay-out-of-ibd
-      (bl.net:reset-tx-requests)
+      (bl.net:reset-txdownloadman)
       (multiple-value-bind (a b srv) (%rc-loopback-pair)
         (unwind-protect
              (let* ((fundings (loop for i from 1 to (+ shared-count 6)
@@ -1032,7 +1032,8 @@ handshake registered both sides."
                               (bl.net:maybe-start-reconciliation a (bl.ser:get-unix-time)))
                             (flush-peer-invs a (bl.ctx:node-context-mempool ctx-a))
                             (flush-peer-invs b (bl.ctx:node-context-mempool ctx-b))
-                            (bl.net:process-tx-requests)
+                            (run-tx-requests ctx-a)
+                            (run-tx-requests ctx-b)
                             (drain-peer-once a ctx-a)
                             (drain-peer-once b ctx-b)
                             (sleep 0.02))
@@ -1050,7 +1051,7 @@ handshake registered both sides."
           (ignore-errors (bl.net:disconnect-peer a))
           (ignore-errors (bl.net:disconnect-peer b))
           (bl.net:close-listener srv)
-          (bl.net:reset-tx-requests))))))
+          (bl.net:reset-txdownloadman))))))
 
 (test two-nodes-reconcile-their-mempools-over-a-real-connection
   "Two of our nodes with -txreconciliation=1 on one loopback connection: the

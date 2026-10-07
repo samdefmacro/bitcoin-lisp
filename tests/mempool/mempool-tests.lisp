@@ -2550,11 +2550,11 @@ wtxid == txid."
          (owtxid (bl.ser:transaction-wtxid o)))
     (is-true (bl.mp:orphan-add pool o nil))
     (is (= 1 (bl.mp:orphan-pool-count pool)))
-    (is (member owtxid (bl.mp:orphans-depending-on pool parent) :test #'equalp))
+    (is (member owtxid (gethash parent (bl.mp:orphan-pool-by-prev pool)) :test #'equalp))
     (is-true (bl.mp:orphan-have pool owtxid))
     (is (bl.mp:orphan-remove pool owtxid))
     (is (= 0 (bl.mp:orphan-pool-count pool)))
-    (is (null (bl.mp:orphans-depending-on pool parent)))))
+    (is (null (gethash parent (bl.mp:orphan-pool-by-prev pool))))))
 
 (test orphan-multiple-announcers
   "One orphan can carry several announcers (Core AddTx/AddAnnouncer): a

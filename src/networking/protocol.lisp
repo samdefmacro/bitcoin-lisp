@@ -441,125 +441,13 @@ net_processing.cpp:6064-6066). Its hash is %PEER-INV-HASH."
      :type (if wtxp bl.ser:+inv-type-wtx+ bl.ser:+inv-type-tx+)
      :hash (%peer-inv-hash peer txid wtxid))))
 
-;;; --- Tx-request tracking (Core TxRequestTracker, simplified) ---
+;;; --- Transaction download: the drive sites of Core's m_txdownloadman ---
 ;;;
-;;; handle-inv used to fire a getdata to the announcing peer with no in-flight
-;;; bookkeeping: the same tx could be requested from every peer that announced
-;;; it at once, and if the one peer we asked never delivered, the tx was lost
-;;; until re-announced. We keep at most one outstanding request per txid, record
-;;; the other announcers as failover candidates, and re-route to one of them if
-;;; the request times out, the peer answers notfound, or it disconnects.
-;;;
-;;; Wave 9 adds Core's txrequest protections (src/txrequest.cpp constants and
-;;; their use in src/node/txdownloadman_impl.cpp:196-282 at d3056bc):
-;;;   - MAX_PEER_TX_ANNOUNCEMENTS (5000): announcements beyond a peer's cap
-;;;     are dropped outright.
-;;;   - Request-time delays: NONPREF_PEER_TX_DELAY (2s) for non-preferred
-;;;     (inbound) peers, TXID_RELAY_DELAY (2s) for txid-based announcements
-;;;     while wtxid-relay peers are connected, OVERLOADED_PEER_TX_DELAY (2s)
-;;;     for peers with >= MAX_PEER_TX_REQUEST_IN_FLIGHT (100) requests
-;;;     outstanding. A delayed announcement becomes a candidate; the
-;;;     scheduler (process-tx-requests, run ~1x/second from the sync loop)
-;;;     requests it once due, preferring preferred (outbound) candidates.
-;;;   - GETDATA_TX_INTERVAL (60s) expiry with failover, and DisconnectedPeer
-;;;     cleanup: a disconnecting peer's announcements are forgotten and its
-;;;     in-flight requests become immediately re-schedulable.
-;;;
-;;; Core's announcement STATES are here (txrequest.cpp:52-100), split across
-;;; two tables rather than one multi-index container: CANDIDATE_DELAYED and
-;;; CANDIDATE_READY are an announcement whose ready time is in the future or
-;;; the past, REQUESTED is the *TX-IN-FLIGHT* entry naming that peer, and
-;;; COMPLETED is the announcement's own flag. CANDIDATE_BEST is not stored --
-;;; the scheduler recomputes it, which is what %TX-REQUEST-BEST-CANDIDATE is,
-;;; from the same salted priority Core sorts the ByTxHash index by
-;;; (%TX-REQUEST-PRIORITY). The scheduler runs on a ~1s cadence rather than
-;;; per SendMessages pass.
+;;; The TxDownloadManager (txdownloadman.lisp) decides; these functions are
+;;; net_processing.cpp's side of each decision -- what goes on the wire, what
+;;; is validated, what is relayed -- and they call the manager exactly where
+;;; Core calls m_txdownloadman.
 
-(defvar *tx-in-flight* (make-hash-table :test 'equalp)
-  "txid -> (peer . request-time in %TX-REQUEST-NOW seconds); at most one per
-txid.")
-
-(defun %tx-request-now ()
-  "The tx-request tracker's clock, and it is Core's MOCKABLE one. SendMessages
-hands `GetTime<std::chrono::microseconds>()' to GetRequestable
-(net_processing.cpp:6162) and AddTxAnnouncement stamps each announcement's
-reqtime from the same call (txdownloadman_impl.cpp:210-219), so setmocktime
-moves every request delay and the sixty-second expiry with it.
-
-Ours read GET-INTERNAL-REAL-TIME -- a process-relative clock nothing can move
--- for both. That put the whole tracker out of reach of the functional suite,
-which drives it with mocktime and then waits seconds, not minutes:
-p2p_tx_download.py:175-176 jumps the clock past GETDATA_TX_INTERVAL and gives
-the fallback peer ONE second to be asked, and p2p_ibd_txrelay.py:95-96 bumps
-it by NONPREF_PEER_TX_DELAY and waits for the getdata."
-  (bl.ser:get-unix-time))
-
-(defstruct (tx-announcement
-            (:constructor %make-tx-announcement (peer ready priority wtxid))
-            (:conc-name tx-ann-))
-  "One peer's announcement of one txhash — Core's txrequest Announcement
-(txrequest.cpp:52-100). READY is the %TX-REQUEST-NOW time at which it becomes
-requestable (Core m_time as a reqtime: CANDIDATE_DELAYED until then,
-CANDIDATE_READY after). COMPLETED is Core's State::COMPLETED: the peer
-answered notfound, let its request expire, or delivered something for this
-hash, so the announcement is never selected again — but the SLOT STAYS, which
-is the point. Deleting it instead would let that peer re-announce its way
-straight back into the candidate set and would refund the
-MAX_PEER_TX_ANNOUNCEMENTS budget its failure spent, and Core's data structure
-exists to prevent exactly that: \"The same transaction is never requested
-twice from the same peer, unless the announcement was forgotten in between
-... giving a peer multiple chances to announce a transaction would allow them
-to bias requests in their favor, worsening transaction censoring attacks\"
-(txrequest.h:45-58). WTXID is the announcement's own id type, Core's
-Announcement::m_gtxid: a request goes out under the type of the announcement
-it is granted to (GetRequestable returns that GenTxid, txrequest.cpp:595-624,
-and SendMessages builds the getdata from it, net_processing.cpp:6207) -- MSG_WTX
-for a wtxid, MSG_TX|witness-flag for a txid. A wtxid re-requested under
-MSG_WITNESS_TX is a TXID lookup to a Core peer, answered notfound."
-  (peer nil)
-  (ready 0 :type integer)
-  (completed nil :type boolean)
-  (wtxid nil :type boolean)
-  ;; %TX-REQUEST-PRIORITY of (txhash, peer), computed once here because none
-  ;; of its three inputs can change for the life of the announcement -- Core
-  ;; likewise pays for it once, by keeping the ByTxHash index SORTED by it
-  ;; rather than recomputing on every GetRequestable.
-  (priority 0 :type unsigned-byte))
-
-(defvar *tx-announcers* (make-hash-table :test 'equalp)
-  "hash -> list of TX-ANNOUNCEMENT — failover candidates, each requestable
-once its ready time (announcement time + Core's NONPREF/TXID/OVERLOADED
-delays) passes. The peer currently in flight stays in this list; its
-announcement is the record that it announced the hash. A COMPLETED
-announcement stays too, until the hash is forgotten or its last
-non-completed sibling completes.")
-(defvar *tx-peer-announcements* (make-hash-table :test 'eq)
-  "peer -> number of tracked announcements (candidates + in-flight), for the
-MAX_PEER_TX_ANNOUNCEMENTS cap (Core m_txrequest.Count(peer)).")
-(defvar *tx-peer-in-flight* (make-hash-table :test 'eq)
-  "peer -> number of in-flight getdata requests, for the overloaded-peer
-delay (Core m_txrequest.CountInFlight(peer)).")
-(defvar *tx-request-lock* (bt:make-lock "tx-request"))
-
-(defconstant +tx-request-timeout-seconds+ 60
-  "Expire an outstanding tx getdata after this long with no delivery and fail
-over to another announcer (Core GETDATA_TX_INTERVAL, txdownloadman.h:38).")
-(defconstant +max-peer-tx-announcements+ 5000
-  "Per-peer cap on tracked tx announcements; beyond it new announcements from
-the peer are dropped (Core MAX_PEER_TX_ANNOUNCEMENTS, txdownloadman.h:30).")
-(defconstant +max-peer-tx-request-in-flight+ 100
-  "In-flight request count above which a peer's further announcements get the
-overloaded delay (Core MAX_PEER_TX_REQUEST_IN_FLIGHT, txdownloadman.h:25).")
-(defconstant +nonpref-peer-tx-delay-seconds+ 2
-  "Request delay for announcements from non-preferred (inbound) peers (Core
-NONPREF_PEER_TX_DELAY, txdownloadman.h:34).")
-(defconstant +txid-relay-delay-seconds+ 2
-  "Extra delay for txid-based announcements while wtxid-relay peers are
-connected — preferring the malleation-proof id (Core TXID_RELAY_DELAY,
-txdownloadman.h:32).")
-(defconstant +overloaded-peer-tx-delay-seconds+ 2
-  "Extra delay for announcements from overloaded peers (Core
-OVERLOADED_PEER_TX_DELAY, txdownloadman.h:36).")
 (defconstant +max-blocks-in-transit-per-peer+ 16
   "Core MAX_BLOCKS_IN_TRANSIT_PER_PEER (net_processing.cpp:130). Read here
 only for the notfound size guard: a peer cannot have more than its
@@ -571,426 +459,48 @@ that names more items than that is answering nothing we asked for
 peers may hold one block in flight at once, each on its own compact-block
 getblocktxn round trip. The last slot is kept for an outbound peer
 (:4707-4712).")
+(defconstant +max-getdata-size+ 1000
+  "Core MAX_GETDATA_SZ (net_processing.cpp:127): a getdata SendMessages builds
+is sent and a new one begun at this many entries (:6207-6211).")
 
-(defun reset-tx-requests ()
-  "Clear all tx-request tracking (called at node start)."
-  (bt:with-lock-held (*tx-request-lock*)
-    (clrhash *tx-in-flight*)
-    (clrhash *tx-announcers*)
-    (clrhash *tx-peer-announcements*)
-    (clrhash *tx-peer-in-flight*)))
-
-(defun tx-request-preferred-p (peer)
-  "Preferred announcers are requested first and without the non-preferred
-delay (Core's m_preferred = fPreferredDownload, net_processing.cpp:3750 and
-:3892): an outbound connection, or an inbound one holding the noban
-permission, and never an addr-fetch connection. p2p_tx_download.py:231-234
-whitelists noban@127.0.0.1 and expects an inbound peer's inv to be fetched at
-once. Core's third term, CanServeBlocks, is left out here: it is about BLOCK
-download, every peer the tx tests make advertises NODE_NETWORK anyway, and
-the synthetic peers of our own suites do not (PEER-PREFERRED-DOWNLOAD-P keeps
-it for the headers timeout, where it matters)."
-  (and (or (not (peer-inbound peer))
-           (peer-has-permission-p peer +perm-noban+))
-       (not (eq (peer-conn-type peer) :addr-fetch))))
-
-(defun %tx-announcement-delay-seconds (peer wtxidp num-wtxid-peers)
-  "The announcement's request delay in %TX-REQUEST-NOW seconds — the sum Core
-computes in AddTxAnnouncement (txdownloadman_impl.cpp:210-219)."
-  (+ (if (tx-request-preferred-p peer) 0 +nonpref-peer-tx-delay-seconds+)
-     (if (and (not wtxidp) (plusp num-wtxid-peers))
-         +txid-relay-delay-seconds+ 0)
-     (if (and (not (peer-has-permission-p peer +perm-relay+))
-              (>= (gethash peer *tx-peer-in-flight* 0)
-                  +max-peer-tx-request-in-flight+))
-         +overloaded-peer-tx-delay-seconds+ 0)))
-
-(defun %tx-request-mark-in-flight (hash peer now)
-  "Lock held: record an outstanding getdata for HASH to PEER."
-  (setf (gethash hash *tx-in-flight*) (cons peer now))
-  (incf (gethash peer *tx-peer-in-flight* 0)))
-
-(defun %tx-request-clear-in-flight (hash)
-  "Lock held: drop HASH's outstanding request, fixing the peer's count."
-  (let ((entry (gethash hash *tx-in-flight*)))
-    (when entry
-      (let ((n (1- (gethash (car entry) *tx-peer-in-flight* 1))))
-        (if (plusp n)
-            (setf (gethash (car entry) *tx-peer-in-flight*) n)
-            (remhash (car entry) *tx-peer-in-flight*)))
-      (remhash hash *tx-in-flight*))))
-
-(defvar *tx-request-salt* nil
-  "The node-lifetime SipHash key (K0 . K1) that orders tx-request candidates
--- Core PriorityComputer's m_k0/m_k1, two FastRandomContext draws kept for
-the life of the process (txrequest.cpp:105-110). Drawn lazily so nothing in
-start-up ordering depends on it; two threads racing the first draw is benign
-(both values are equally good). A test binds it to fix the ranking.")
-
-(defun %tx-request-salt ()
-  "The node's tx-request SipHash key, drawn from the OS CSPRNG on first use."
-  (or *tx-request-salt*
-      (setf *tx-request-salt* (random-siphash-key))))
-
-(defun %tx-request-priority (hash peer)
-  "Core's PriorityComputer (txrequest.cpp:112-118):
-
-    SipHash(k0, k1, txhash || peer) >> 1  |  preferred << 63
-
-and the HIGHEST priority wins. Two properties follow, and both are the point
-(txrequest.h:66-84). Preferred (outbound) announcers outrank every
-non-preferred one, because their bit is the most significant. Within a class
-the winner is a function of the transaction and of a per-process secret, so
-it is uniform over the candidates, DIFFERENT for each transaction, and not
-computable by anyone else.
-
-Selecting by announcement order instead -- preferred first, then earliest
-ready -- put the choice entirely in the announcer's hands: a peer that races
-the network's announcements took the request for EVERY transaction rather
-than for a random 1/(number of preferred candidates) of them, and A such
-connections held A consecutive GETDATA_TX_INTERVAL windows with no variance.
-Core models that delay as k * GETDATA_TX_INTERVAL with k hypergeometric
-precisely because the pick is random; announcement order made k its maximum,
-deterministically, at the attacker's choosing.
-
-Announcement TIME keeps its other role -- gating readiness through the
-NONPREF / TXID_RELAY / OVERLOADED delays -- and stops deciding the winner."
-  (let* ((salt (%tx-request-salt))
-         (message (concatenate '(vector (unsigned-byte 8))
-                               hash (int-to-le-bytes (peer-id peer) 8)))
-         (low-bits (ash (bl.crypto:siphash-2-4 (car salt) (cdr salt) message)
-                        -1)))
-    (if (tx-request-preferred-p peer)
-        (logior low-bits (ash 1 63))
-        low-bits)))
-
-(defun %tx-announcement-for (hash peer)
-  "Lock held: PEER's announcement of HASH, completed or not (Core's ByPeer
-lookup, which searches both the CANDIDATE_BEST and the non-best key), or NIL."
-  (find peer (gethash hash *tx-announcers*) :key #'tx-ann-peer :test #'eq))
-
-(defun %decf-peer-announcements (peer)
-  "Lock held: charge one announcement back to PEER's MAX_PEER_TX_ANNOUNCEMENTS
-budget (Core m_peerinfo[peer].m_total--)."
-  (let ((n (1- (gethash peer *tx-peer-announcements* 1))))
-    (if (plusp n)
-        (setf (gethash peer *tx-peer-announcements*) n)
-        (remhash peer *tx-peer-announcements*))))
-
-(defun %tx-announcers-erase (hash)
-  "Lock held: erase EVERY announcement of HASH, completed or not, fixing each
-peer's count — Core ForgetTxHash (txrequest.cpp:560-566) and the branch of
-MakeCompleted that fires when the last non-completed announcement completes."
-  (dolist (ann (gethash hash *tx-announcers*))
-    (%decf-peer-announcements (tx-ann-peer ann)))
-  (remhash hash *tx-announcers*))
-
-(defun %tx-request-make-completed (hash peer)
-  "Lock held: Core MakeCompleted (txrequest.cpp:456-478). PEER's announcement
-of HASH becomes COMPLETED — kept, so a re-announcement from PEER is still
-refused by the (peer, txhash) uniqueness of Core's ByPeer index and its
-budget stays charged — UNLESS it was the last non-COMPLETED announcement for
-the hash, in which case every announcement of the hash is erased
-(IsOnlyNonCompleted, :463-470; \"If for a given txhash only already-failed
-announcements remain, they are all forgotten\", txrequest.h:52)."
-  (let ((ann (%tx-announcement-for hash peer)))
-    (when (and ann (not (tx-ann-completed ann)))
-      (if (find-if (lambda (a) (and (not (eq a ann)) (not (tx-ann-completed a))))
-                   (gethash hash *tx-announcers*))
-          (setf (tx-ann-completed ann) t)
-          (%tx-announcers-erase hash)))))
-
-(defun %tx-request-drop-announcer (hash peer)
-  "Lock held: remove PEER's announcement of HASH (if any), fixing its count.
-When only COMPLETED announcements would be left — or none — the whole entry
-goes, which is where Core's DisconnectedPeer arrives by calling MakeCompleted
-before erasing (txrequest.cpp:549-556)."
-  (let ((ann (%tx-announcement-for hash peer)))
-    (when ann
-      (let ((rest (remove ann (gethash hash *tx-announcers*))))
-        (setf (gethash hash *tx-announcers*) rest)
-        (%decf-peer-announcements peer)
-        (unless (find-if-not #'tx-ann-completed rest)
-          (%tx-announcers-erase hash))))))
-
-(defun tx-request-count (peer)
-  "Number of announcements tracked for PEER (Core m_txrequest.Count)."
-  (bt:with-lock-held (*tx-request-lock*)
-    (gethash peer *tx-peer-announcements* 0)))
-
-(defun tx-request-wanted-p (hash peer &optional wtxidp (num-wtxid-peers 0))
-  "Record PEER as an announcer of HASH and return T iff a getdata should go to
-PEER immediately -- no request outstanding, the announcement carries no delay,
-and no ready announcement of HASH outranks it. NIL means the announcement was
-either dropped (per-peer cap), retained as a failover candidate behind an
-in-flight request or a better ready candidate, or deferred until its
-Core-mandated delay passes (the scheduler grants the hash then). WTXIDP marks the
-announcement as wtxid-based (MSG_WTX); the announcement keeps it, so whichever
-announcer a request is later granted to is asked under the id type IT
-announced. NUM-WTXID-PEERS is the count of connected wtxid-relay peers,
-driving Core's TXID_RELAY_DELAY."
-  (bt:with-lock-held (*tx-request-lock*)
-    ;; Another announcement from the same peer — live or COMPLETED — is
-    ;; refused by the (peer, txhash) uniqueness of Core's ByPeer index
-    ;; (ReceivedInv's failed emplace, txrequest.cpp:578-592): nothing new is
-    ;; recorded, and a peer whose request failed does not get a second one.
-    (when (%tx-announcement-for hash peer)
-      (return-from tx-request-wanted-p nil))
-    ;; MAX_PEER_TX_ANNOUNCEMENTS: drop, don't record
-    ;; (txdownloadman_impl.cpp:204-207) -- unless the peer holds the relay
-    ;; permission, which lifts both this cap and the overloaded delay
-    ;; (:204, :218; p2p_tx_download.py:307-310 sends 5001 invs from a
-    ;; relay-whitelisted peer and expects 5001 getdatas).
-    (when (and (not (peer-has-permission-p peer +perm-relay+))
-               (>= (gethash peer *tx-peer-announcements* 0)
-                   +max-peer-tx-announcements+))
-      (return-from tx-request-wanted-p nil))
-    (let* ((now (%tx-request-now))
-           (ready (+ now (%tx-announcement-delay-seconds peer wtxidp
-                                                         num-wtxid-peers))))
-      (let ((ann (%make-tx-announcement peer ready (%tx-request-priority hash peer)
-                                        (and wtxidp t))))
-        (push ann (gethash hash *tx-announcers*))
-        (incf (gethash peer *tx-peer-announcements* 0))
-        ;; Asked at once only if this is the candidate GetRequestable would
-        ;; grant now -- nothing in flight, and no ready announcement of higher
-        ;; priority (txrequest.cpp:595-624). Core's ReceivedInv never asks;
-        ;; the SendMessages after it does, through GetRequestable
-        ;; (net_processing.cpp:6162). Otherwise the scheduler grants it when
-        ;; it is due, to whichever candidate is then the best.
-        (cond ((gethash hash *tx-in-flight*) nil)
-              ((not (eq ann (%tx-request-best-candidate (gethash hash *tx-announcers*) now)))
-               nil)
-              (t (%tx-request-mark-in-flight hash peer now)
-                 t))))))
-
-(defun tx-request-received (hash)
-  "Forget HASH entirely — Core ForgetTxHash (txrequest.cpp:560-566): the
-outstanding request and EVERY peer's announcement of it are released.
-
-This is for a hash that is genuinely RESOLVED, and only for those: it entered
-the mempool, a block confirmed it, it went into the orphanage, or it failed
-in a way that will not be reconsidered. A transaction merely ARRIVING is not
-that — see TX-REQUEST-RECEIVED-RESPONSE, which is what a delivery calls."
-  (bt:with-lock-held (*tx-request-lock*)
-    (%tx-request-clear-in-flight hash)
-    (%tx-announcers-erase hash)))
-
-(defun tx-request-forget-tx (txid wtxid)
-  "ForgetTxHash under BOTH of a transaction's ids — Core writes the pair at
-every point where the transaction is resolved (MempoolAcceptedTx :327-328,
-the orphan branches :418-419 and :434-435, BlockConnected :107-108). One call
-when the transaction has no witness and the two ids are equal."
-  (tx-request-received txid)
-  (unless (equalp wtxid txid)
-    (tx-request-received wtxid)))
-
-(defun tx-request-received-response (peer hash)
-  "PEER answered our request for HASH — with the transaction, or with a
-notfound. Core ReceivedResponse (txrequest.cpp:667-676): ONLY this peer's
-announcement is completed, so every other announcer stays a candidate and the
-next scheduler pass re-routes to one of them.
-
-It is deliberately not ForgetTxHash. A peer that sends an unsolicited copy of
-a transaction — or a witness-malleated twin, same txid and a different wtxid
-— would otherwise release every honest announcer of that txid and the
-scheduler would issue no further request for it."
-  (bt:with-lock-held (*tx-request-lock*)
-    (let ((entry (gethash hash *tx-in-flight*)))
-      (when (and entry (eq (car entry) peer))
-        (%tx-request-clear-in-flight hash)))
-    (%tx-request-make-completed hash peer)))
-
-
-(defun tx-request-candidate-peers (hash)
-  "Every peer with a LIVE (non-COMPLETED) announcement of HASH — Core
-TxRequestTracker::GetCandidatePeers (txrequest.cpp:568-576). Orphan intake
-uses it to enrol every peer that announced the orphan as a resolution
-candidate, not only the one that delivered it: a peer announces a transaction
-ONCE, so an announcer we do not enrol here will not offer itself again."
-  (bt:with-lock-held (*tx-request-lock*)
-    (loop for ann in (gethash hash *tx-announcers*)
-          unless (tx-ann-completed ann)
-            collect (tx-ann-peer ann))))
-
-(defun tx-request-disconnected-peer (peer)
-  "Forget every announcement PEER made and release its in-flight requests so
-other announcers take over (Core TxRequestTracker::DisconnectedPeer via
-TxDownloadManagerImpl::DisconnectedPeer). Failover getdatas go out on the
-next scheduler pass — deliberately not from here, which may run on a non-sync
-thread. Registered as *peer-disconnect-hook*."
-  (bt:with-lock-held (*tx-request-lock*)
-    ;; Release in-flight requests held by this peer.
-    (let ((held '()))
-      (maphash (lambda (hash entry)
-                 (when (eq (car entry) peer) (push hash held)))
-               *tx-in-flight*)
-      (dolist (hash held) (%tx-request-clear-in-flight hash)))
-    ;; Forget its announcements.
-    (let ((announced '()))
-      (maphash (lambda (hash anns)
-                 (when (find peer anns :key #'tx-ann-peer :test #'eq)
-                   (push hash announced)))
-               *tx-announcers*)
-      (dolist (hash announced) (%tx-request-drop-announcer hash peer)))
-    (remhash peer *tx-peer-announcements*)
-    (remhash peer *tx-peer-in-flight*)))
-
-;;; Registered here rather than called directly from peer.lisp (which loads
-;;; first): the tracker must observe every disconnect path.
-(setf *peer-disconnect-hook* #'tx-request-disconnected-peer)
-
-(defun %tx-request-selectable-p (ann now)
-  "Core IsSelectable (txrequest.cpp:88-92) in our two-table form: the
-announcement is not COMPLETED, its delay has passed (CANDIDATE_READY rather
-than CANDIDATE_DELAYED), and its peer is still usable."
-  (and (not (tx-ann-completed ann))
-       (<= (tx-ann-ready ann) now)
-       (eq (peer-state (tx-ann-peer ann)) :ready)))
-
-(defun %tx-request-best-candidate (anns now)
-  "The selectable announcement in ANNS with the highest %TX-REQUEST-PRIORITY
-at NOW — Core's CANDIDATE_BEST (GetRequestable, txrequest.cpp:595-624, over
-an index sorted by that same priority)."
-  (let ((best nil))
-    (dolist (ann anns best)
-      (when (and (%tx-request-selectable-p ann now)
-                 (or (null best)
-                     (> (tx-ann-priority ann) (tx-ann-priority best))))
-        (setf best ann)))))
-
-(defun %tx-request-schedule (hash now to-send)
-  "Lock held: grant HASH to its best candidate at NOW and add the getdata inv
-to TO-SEND, an alist of peer -> invs, which is returned. Nothing happens when
-a request for HASH is already outstanding or no announcement is selectable —
-Core GetRequestable's CANDIDATE_BEST pick followed by RequestedTx."
-  (if (gethash hash *tx-in-flight*)
-      to-send
-      (let ((best (%tx-request-best-candidate (gethash hash *tx-announcers*) now)))
-        (if (null best)
-            to-send
-            (let* ((peer (tx-ann-peer best))
-                   (inv (tx-request-inv hash (tx-ann-wtxid best) peer))
-                   (bucket (assoc peer to-send :test #'eq)))
-              (%tx-request-mark-in-flight hash peer now)
-              (cond (bucket (push inv (cdr bucket)) to-send)
-                    (t (cons (list peer inv) to-send))))))))
-
-(defun %already-have-and-forget-p (inv mempool recent-rejects)
-  "T when the transaction INV would fetch has arrived by some other route
-since its announcement -- a block confirmed it, an RPC submitted it, a
-package carried it -- in which case its tracker entry is forgotten instead of
-requested. Core's belt-and-suspenders in GetRequestsToSend
-(txdownloadman_impl.cpp:274-284), where every requestable announcement is
-re-checked against AlreadyHaveTx immediately before it becomes a getdata."
-  (let ((hash (bl.ser:inv-vector-hash inv)))
-    (when (%already-have-tx-p hash
-                              (= (bl.ser:inv-vector-type inv)
-                                 bl.ser:+inv-type-wtx+)
-                              mempool recent-rejects)
-      (tx-request-received hash)
-      t)))
-
-(defun %drop-already-have-requests (to-send ctx)
-  "TO-SEND minus the requests CTX says are pointless. Runs OUTSIDE the
-tracker lock: the check reads the mempool and the orphanage, which have locks
-of their own. With no CTX (or no mempool in it) nothing is dropped -- the
-re-check is an optimisation, never a gate."
-  (if (null ctx)
-      to-send
-      (bl.ctx:with-node-context (mempool recent-rejects) ctx
-        (if (null mempool)
-            to-send
-            (loop for (peer . invs) in to-send
-                  for live = (remove-if (lambda (inv)
-                                          (%already-have-and-forget-p
-                                           inv mempool recent-rejects))
-                                        invs)
-                  when live collect (cons peer live))))))
-
-(defun %send-tx-getdatas (to-send)
-  "Send TO-SEND (peer -> invs, as %TX-REQUEST-SCHEDULE builds it) as one
-getdata per peer, OUTSIDE the tracker lock, and return the number of invs
-sent. The id type of each inv was decided by TX-REQUEST-INV when the entry
-was scheduled."
-  (let ((sent 0))
-    (loop for (peer . invs) in to-send
-          do (incf sent (length invs))
-             (handler-case
-                 (send-message peer (bl.ser:make-getdata-message invs))
-               (error () nil)))
-    sent))
-
-(defun process-tx-requests (&optional ctx)
-  "Send getdatas for announcements whose delay has passed and that have no
-request outstanding — the scheduler half of Core's GetRequestsToSend
-(txdownloadman_impl.cpp:264-284), run ~1x/second from the sync loop. Each
-hash goes to its best candidate. Returns the number of requests sent.
-
-CTX, the node-context, is optional and enables Core's belt-and-suspenders
-re-check: a hash we have acquired since its announcement is forgotten rather
-than requested (%DROP-ALREADY-HAVE-REQUESTS)."
-  (let ((now (%tx-request-now))
-        (to-send '()))                  ; (peer . list-of-invs)
-    (bt:with-lock-held (*tx-request-lock*)
-      (maphash (lambda (hash anns)
-                 (declare (ignore anns))
-                 (setf to-send (%tx-request-schedule hash now to-send)))
-               *tx-announcers*))
-    (%send-tx-getdatas (%drop-already-have-requests to-send ctx))))
-
-(defun process-tx-requests-for (hashes)
-  "The same pass restricted to HASHES — the prompt failover after a peer says
-notfound. Its cost is the message's own item count and nothing else.
-
-Re-running the WHOLE scheduler here instead made a 61-byte notfound buy a
-scan of every tracked announcement under the one lock the tx-relay path
-serialises on: about 1 ms per scan at the 5,000 hashes a single connection
-can reach by itself, 10 ms at 50,000, times the 32 messages the pump admits
-per peer per pass, unauthenticated and uncharged. Core does not re-issue from
-the NOTFOUND branch at all -- ReceivedNotFound is one indexed ReceivedResponse
-per item (txdownloadman_impl.cpp:288-294) and SendMessages re-issues from a
-per-peer index of CANDIDATE_BEST announcements (txrequest.cpp:595-624)."
-  (let ((now (%tx-request-now))
-        (to-send '()))
-    (bt:with-lock-held (*tx-request-lock*)
-      (dolist (hash hashes)
-        (setf to-send (%tx-request-schedule hash now to-send))))
-    (%send-tx-getdatas to-send)))
-
-(bl.vi:define-validation-hook :block-connected tx-request-block-connected
+(bl.vi:define-validation-hook :block-connected txdownload-note-block-connected
     (chainstate block block-hash height spent-utxos)
-  "Core BlockConnected's tx-download half (txdownloadman_impl.cpp:98-110): a
-transaction the block just confirmed is RESOLVED, so every peer's tracked
-announcement of it goes, under both ids. Otherwise the next scheduler pass
-sends a getdata for a transaction we already know is confirmed, and a Core
-peer answers it in full out of m_most_recent_block_txs -- a whole redundant
-transaction body that handle-tx then discards on its recently-confirmed
-check.
-
-The recently-confirmed FILTER half of the same Core function is
-NOTE-BLOCK-TXS-CONFIRMED, in the validation layer that owns the filter, driven
-from here; the hook is what lets validation reach both without naming
-networking.
-
-Core runs the whole of it only for the active chainstate and only OUTSIDE
-initial block download (PeerManagerImpl::BlockConnected,
-net_processing.cpp:2086-2092), reading the latched IsInitialBlockDownload --
-*CACHED-IS-IBD* here. The filter used to be filled during IBD too, which made a
-transaction confirmed then unrequestable once the node was out:
-p2p_ibd_txrelay.py:93-96 announces the coinbase of a block mined in IBD and
-waits for the getdata."
+  "Core PeerManagerImpl::BlockConnected's tx-download call
+(net_processing.cpp:2086-2092): m_txdownloadman.BlockConnected(pblock), only
+for the active chainstate and only OUTSIDE initial block download, reading the
+latched IsInitialBlockDownload -- *CACHED-IS-IBD* here. The recently-confirmed
+filter used to be filled during IBD too, which made a transaction confirmed
+then unrequestable once the node was out: p2p_ibd_txrelay.py:93-96 announces
+the coinbase of a block mined in IBD and waits for the getdata. An assumeutxo
+TARGETED chainstate re-derives ancient history; its blocks would otherwise
+release announcements of transactions that are still unconfirmed for us."
   (declare (ignore block-hash height spent-utxos))
-  ;; An assumeutxo TARGETED chainstate re-derives ancient history; its blocks
-  ;; would otherwise release announcements of transactions that are still
-  ;; unconfirmed for us.
   (unless (or *cached-is-ibd*
               (bl.store:chain-state-target-blockhash chainstate))
-    (bl.val:note-block-txs-confirmed block)
-    (map nil (lambda (tx)
-               (tx-request-forget-tx (bl.ser:transaction-hash tx)
-                                     (bl.ser:transaction-wtxid tx)))
-         (bl.ser:bitcoin-block-transactions block))))
+    (txdownload-block-connected (node-txdownloadman) block)))
+
+(bl.vi:define-validation-hook :block-disconnected txdownload-note-block-disconnected
+    (chainstate block block-hash height)
+  "Core PeerManagerImpl::BlockDisconnected (net_processing.cpp:2095-2099):
+m_txdownloadman.BlockDisconnected(), so transactions a reorg returns to
+circulation are not held back by the recently-confirmed filter. Validation
+announces disconnects after a reorg commits; a TARGETED chainstate's are
+history being re-derived, not transactions leaving the node's chain, and Core
+disconnects only on the active one."
+  (declare (ignore block block-hash height))
+  (unless (bl.store:chain-state-target-blockhash chainstate)
+    (txdownload-block-disconnected (node-txdownloadman))))
+
+(bl.vi:define-validation-hook :active-tip-change txdownload-note-active-tip-change
+    (chainstate)
+  "Core PeerManagerImpl::ActiveTipChange (net_processing.cpp:2045-2059):
+outside initial block download, every rejection may be stale at the new tip --
+a timelock, a fee floor -- so m_txdownloadman.ActiveTipChange() resets both
+rejection filters. Validation announces it for the active chainstate after
+every activation step and every reorg, as Core's ActivateBestChain and
+InvalidateBlock do (validation.cpp:3472-3475, :3722-3726)."
+  (unless (initial-block-download-p chainstate)
+    (txdownload-active-tip-change (node-txdownloadman))))
 
 (defun tx-fetch-inv-type (peer)
   "Inv type for a TXID-based tx getdata to PEER: MSG_TX|MSG_WITNESS_FLAG when
@@ -1014,61 +524,29 @@ wtxid-based entry, MSG_TX|witness-flag for a txid-based one — Core's
              (tx-fetch-inv-type peer))
    :hash hash))
 
-(defun retry-timed-out-tx-requests (&optional ctx)
-  "Re-route each in-flight tx getdata outstanding longer than
-GETDATA_TX_INTERVAL to the next ready announcer; drop tracking for a tx whose
-announcers have all gone away. The expired announcement is marked COMPLETED,
-which is what Core's SetTimePoint does to a REQUESTED entry whose expiry has
-passed (txrequest.cpp:485-500) — the peer keeps the slot it burned, so it may
-not re-announce its way into a second GETDATA_TX_INTERVAL window on the same
-transaction. Returns the number re-requested. CTX enables the same
-belt-and-suspenders re-check PROCESS-TX-REQUESTS takes it for."
-  (let ((now (%tx-request-now))
-        (to-send '()))
-    (bt:with-lock-held (*tx-request-lock*)
-      (let ((timed-out '()))
-        (maphash (lambda (txid entry)
-                   ;; Expired AT the expiry, not a second after it: Core
-                   ;; stamps expiry = request time + GETDATA_TX_INTERVAL
-                   ;; (txdownloadman_impl.cpp:278) and SetTimePoint expires
-                   ;; `m_time <= now' (txrequest.cpp:494).
-                   (when (>= (- now (cdr entry)) +tx-request-timeout-seconds+)
-                     (push (cons txid (car entry)) timed-out)))
-                 *tx-in-flight*)
-        (dolist (item timed-out)
-          (let ((txid (car item))
-                (old-peer (cdr item)))
-            (%tx-request-clear-in-flight txid)
-            (%tx-request-make-completed txid old-peer)
-            (setf to-send (%tx-request-schedule txid now to-send))
-            (unless (gethash txid *tx-in-flight*)
-              ;; No selectable candidate right now. Entries with only delayed
-              ;; candidates stay for the scheduler; an entry whose every
-              ;; announcer has gone away is dropped.
-              (let ((anns (gethash txid *tx-announcers*)))
-                (unless (find-if (lambda (ann)
-                                   (eq (peer-state (tx-ann-peer ann)) :ready))
-                                 anns)
-                  (%tx-announcers-erase txid)))))))
-      ;; Reclaim announcements left by a peer that has been retired. The
-      ;; disconnect hook is what normally does this and every retirement path
-      ;; now runs it, but the sweep above only ever looks at *TX-IN-FLIGHT*,
-      ;; so a CANDIDATE announcement -- one that was never requested -- had no
-      ;; route back at all: %TX-REQUEST-SELECTABLE-P requires a :ready peer, so
-      ;; a retired peer's candidate can never become in-flight and can never
-      ;; expire. A peer may announce up to +MAX-PEER-TX-ANNOUNCEMENTS+ hashes
-      ;; that resolve for nobody, so leaving that to one hook is a cap that
-      ;; stops bounding anything the moment a path forgets to call it. This
-      ;; makes the leak unreachable rather than merely unlikely.
-      (let ((retired '()))
-        (maphash (lambda (txid anns)
-                   (dolist (ann anns)
-                     (unless (peer-live-p (tx-ann-peer ann))
-                       (push (cons txid (tx-ann-peer ann)) retired))))
-                 *tx-announcers*)
-        (dolist (item retired)
-          (%tx-request-drop-announcer (car item) (cdr item)))))
-    (%send-tx-getdatas (%drop-already-have-requests to-send ctx))))
+(defun send-tx-requests (peer mgr &optional (now (%tx-request-now)))
+  "SendMessages' transaction getdata section (net_processing.cpp:6201-6217):
+ask PEER for what MGR's GetRequestsToSend hands it at NOW, MAX_GETDATA_SZ
+entries per message, each under the id type of the announcement it was granted
+to. Returns the number of transactions requested."
+  (let* ((invs (mapcar (lambda (gtxid) (tx-request-inv (car gtxid) (cdr gtxid) peer))
+                       (txdownload-get-requests-to-send mgr peer now)))
+         (sent (length invs)))
+    (loop while invs
+          do (let ((batch (subseq invs 0 (min +max-getdata-size+ (length invs)))))
+               (setf invs (nthcdr (length batch) invs))
+               (handler-case (send-message peer (bl.ser:make-getdata-message batch))
+                 (error () nil))))
+    sent))
+
+(defun send-tx-requests-to-peers (peers mgr)
+  "Run SEND-TX-REQUESTS against the TxDownloadManager MGR for every :READY
+peer in PEERS, as Core's message handler runs SendMessages for every node on
+each pass (net.cpp:3143-3148). Returns the number of transactions requested."
+  (let ((now (%tx-request-now)))
+    (loop for peer in peers
+          when (eq (peer-state peer) :ready)
+            sum (send-tx-requests peer mgr now))))
 
 ;;; Initial-block-download status (Core ChainstateManager::IsInitialBlockDownload)
 
@@ -1155,92 +633,6 @@ predicate that runs once per accepted transaction ask it."
                       (1- (bl.store:block-index-entry-height best))))
               t))))
 
-(defun count-wtxid-relay-peers (peers)
-  "Number of connected peers that negotiated BIP339 wtxid relay (Core
-m_num_wtxid_peers, txdownloadman_impl.cpp ConnectedPeer/DisconnectedPeer).
-Drives the TXID_RELAY_DELAY on txid-based announcements."
-  (count-if (lambda (p) (and (eq (peer-state p) :ready)
-                             (peer-wtxid-relay p)))
-            peers))
-
-(defun %already-have-tx-p (hash wtxidp mempool recent-rejects
-                           &optional include-reconsiderable)
-  "Core AlreadyHaveTx (txdownloadman_impl.cpp:126-148): the orphanage (HASH
-cast to a wtxid — never a real txid lookup, witness malleation makes txid
-matches unreliable; for non-segwit txs txid == wtxid so the cast still finds
-them), the recent-confirmed filter, recent rejects, and the mempool by the id
-the announcement implies.
-
-INCLUDE-RECONSIDERABLE is Core's parameter of the same name (declared at
-:125, consulted at :142). Core passes TRUE at exactly one site,
-AddTxAnnouncement (:199); every other caller passes false (:180, :274, :395,
-:527). Set it where the question is \"is there any point requesting this?\" —
-a tx that failed reconsiderably must not be re-downloaded to be submitted
-alone. Leave it NIL where the question is \"can this still be resolved?\" —
-notably when filtering an orphan's missing parents, since a low-feerate
-parent is exactly what the orphan may be able to fee-bump (:393-395)."
-  (or (bl.mp:orphan-have
-       (bl.mp:mempool-orphan-pool mempool) hash)
-      (and include-reconsiderable
-           (bl.val:reconsiderable-reject-p hash))
-      (bl.val:recently-confirmed-p hash)
-      (bl:recent-reject-p recent-rejects hash)
-      (if wtxidp
-          (bl.mp:mempool-get-by-wtxid mempool hash)
-          (bl.mp:mempool-has mempool hash))))
-
-(defun %add-orphan-resolution-candidate (peer otx parents mempool num-wtxid-peers)
-  "Core MaybeAddOrphanResolutionCandidate and the AddTx that follows it
-(txdownloadman_impl.cpp:226-262, :412-415): unless PEER is already an
-announcer of the orphan OTX, register its still-missing PARENTS with the
-tx-request tracker as txid-based announcements from PEER (with the usual
-delays; the bulk per-peer cap check lives in request-orphan-parents) and
-record PEER as an announcer of the orphan.
-
-The orphanage entry is made only when the registration SUCCEEDED. A peer
-already over MAX_PEER_TX_ANNOUNCEMENTS adds nothing, which is what stops a
-peer that floods us with invs and orphans from filling the orphanage
-(\"If there is no candidate for orphan resolution, AddTx will not be called\",
-:404-406). Returns T when PEER was enrolled."
-  (let ((pool (bl.mp:mempool-orphan-pool mempool))
-        (wtxid (bl.ser:transaction-wtxid otx)))
-    (when (and (not (bl.mp:orphan-have-from-peer pool wtxid peer))
-               (request-orphan-parents peer parents num-wtxid-peers))
-      (bl.mp:orphan-add pool otx peer)
-      t)))
-
-(defun %orphan-missing-parents (otx mempool recent-rejects)
-  "OTX's parents that are worth requesting: all of its unique parents, minus
-everything AlreadyHaveTx covers -- the orphanage, the recently-confirmed filter,
-the rejects and the mempool (Core's std::erase_if(unique_parents,
-AlreadyHaveTx(...)), txdownloadman_impl.cpp:391-396). INCLUDE-RECONSIDERABLE
-stays false there and here: a parent rejected for too low a feerate is exactly
-the one this orphan may be able to fee-bump.
-
-The UTXO set is deliberately NOT consulted, as Core does not consult it: a
-parent confirmed long enough ago to have left the recently-confirmed filter is
-requested too. p2p_orphan_handling.py:295 expects exactly that getdata; we
-dropped every parent with a coin in the UTXO set."
-  (remove-if (lambda (ptxid)
-               (%already-have-tx-p ptxid nil mempool recent-rejects))
-             (unique-parent-txids otx)))
-
-(defun %maybe-add-orphan-resolution-candidate (peer orphan-wtxid mempool
-                                               recent-rejects num-wtxid-peers)
-  "A wtxid announcement matched a stored orphan: treat PEER as an orphan-
-resolution candidate instead of requesting the announced tx again (Core
-AddTxAnnouncement's orphan branch, txdownloadman_impl.cpp:172-190)."
-  (let ((otx (bl.mp:orphan-tx (bl.mp:mempool-orphan-pool mempool)
-                              orphan-wtxid)))
-    (when otx
-      (let ((parents (%orphan-missing-parents otx mempool recent-rejects)))
-        ;; All parents accepted/rejected since the orphan was stored: nothing
-        ;; to resolve from this peer (the orphan awaits reprocessing), which
-        ;; is Core's early return at :182-185.
-        (when parents
-          (%add-orphan-resolution-candidate peer otx parents mempool
-                                            num-wtxid-peers))))))
-
 (define-p2p-handler "inv" (peer payload ctx)
   "Handle an inv message.
 
@@ -1255,15 +647,16 @@ once headers connect, the IBD/follow-tip path issues the actual getdata.
 Mirrors Bitcoin Core net_processing.cpp:4126-4214 (reject_tx_invs,
 wtxidrelay-mismatch skip, AddTxAnnouncement, best_block tracking plus a
 single MaybeSendGetHeaders after the inv vector is fully scanned)."
-  (bl.ctx:with-node-context (chain-state mempool recent-rejects peers utxo-set) ctx
+  (bl.ctx:with-node-context (chain-state mempool) ctx
   (let ((inv-vectors (bl.ser:parse-inv-payload payload))
         ;; Core's own RejectIncomingTxs, not a third inlined copy of it
         ;; (net_processing.cpp:4134) -- so the RELAY permission excuses the
         ;; -blocksonly clause here exactly as it does for the VERSION we sent
         ;; and for the tx handler.
         (reject-tx-invs (reject-incoming-txs-p peer))
-        (num-wtxid-peers (count-wtxid-relay-peers peers))
-        (wanted '())
+        ;; Core's current_time, read once for the whole message
+        ;; (net_processing.cpp:4122).
+        (now (%tx-request-now))
         (unknown-block-hash nil))
     (dolist (inv inv-vectors)
       (let ((inv-type (bl.ser:inv-vector-type inv))
@@ -1315,39 +708,19 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
                ;; by. Without this we announce every transaction we accept
                ;; straight back to the peers that announced it to us.
                (%mark-tx-known-to-peer peer hash)
+               ;; Core requests announced txs only outside IBD -- their
+               ;; inputs won't resolve against a stale UTXO set anyway
+               ;; (net_processing.cpp:4176-4180 gates AddTxAnnouncement on
+               ;; !IsInitialBlockDownload). The announcement is only
+               ;; RECORDED here: the getdata goes out from the SendMessages
+               ;; pass that follows (SEND-TX-REQUESTS), as Core's does.
                (when (and mempool
-                          ;; Core requests announced txs only outside IBD —
-                          ;; their inputs won't resolve against a stale UTXO
-                          ;; set anyway (net_processing.cpp:4176-4180 gates
-                          ;; AddTxAnnouncement on !IsInitialBlockDownload).
                           (not (initial-block-download-p chain-state)))
-                 (cond
-                   ;; A wtxid announcement matching a stored orphan makes
-                   ;; PEER an orphan-resolution candidate: fetch the missing
-                   ;; PARENTS from it, not the orphan again.
-                   ((and wtxidp utxo-set
-                         (bl.mp:orphan-have
-                          (bl.mp:mempool-orphan-pool mempool)
-                          hash))
-                    (%maybe-add-orphan-resolution-candidate
-                     peer hash mempool recent-rejects num-wtxid-peers))
-                   ;; include-reconsiderable: a tx whose last failure was
-                   ;; reconsiderable must not be requested to be submitted
-                   ;; alone again (Core AddTxAnnouncement, :199).
-                   ((%already-have-tx-p hash wtxidp mempool recent-rejects t)
-                    nil)
-                   ;; Records PEER as an announcer AND the id type of the
-                   ;; announcement (wtxid vs txid), so a timed-out request
-                   ;; fails over with the right inv type; T only if no request
-                   ;; is outstanding AND the announcement carries no delay
-                   ;; (non-preferred / txid-relay / overloaded) — delayed ones
-                   ;; go out via process-tx-requests when due.
-                   ((tx-request-wanted-p hash peer wtxidp num-wtxid-peers)
-                    ;; Request with the id type the announcement used: wtxids
-                    ;; as MSG_WTX, txids as MSG_TX|WITNESS_FLAG — Core's
-                    ;; "gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | GetFetchFlags)"
-                    ;; (net_processing.cpp:6207).
-                    (push (tx-request-inv hash wtxidp peer) wanted))))))))))
+                 (let ((have (txdownload-add-tx-announcement
+                              (ctx-txdownloadman ctx) peer hash wtxidp now)))
+                   (bl:log-cat "net" "got inv: ~A  ~:[new~;have~] peer=~D"
+                               (%inv-vector-description inv) have
+                               (peer-id peer))))))))))
     ;; Throttled, as Core's is (MaybeSendGetHeaders at :4198, one per
     ;; HEADERS_RESPONSE_TIME per peer): a peer announcing block after block by
     ;; inv buys one getheaders per window, not one per inv -- p2p_sendheaders.py
@@ -1379,50 +752,36 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
       ;; the peer's one pre-sync announcement, and the block that spent it.
       (unless (peer-headers-sync-started peer)
         (setf (peer-inv-triggered-getheaders-before-sync peer) t
-              *last-block-inv-triggering-headers-sync* unknown-block-hash)))
-    (when wanted
-      (send-message peer
-                    (bl.ser:make-getdata-message
-                     (nreverse wanted)))))))
+              *last-block-inv-triggering-headers-sync* unknown-block-hash))))))
 
 ;;; Notfound handling
 
 (define-p2p-handler "notfound" (peer payload ctx)
   "Handle a notfound message: the peer is telling us it lacks one or
-more items we requested via getdata. For tx items, complete the peer's
-announcement in the tx-request tracker so the request fails over to
-another announcer instead of burning the 60s expiry (Core
-ReceivedNotFound -> m_txrequest.ReceivedResponse,
-txdownloadman_impl.cpp:287-293). Block items are ignored, as Core's
-NOTFOUND arm ignores them (net_processing.cpp, tx invs only): no Core
-peer — and no bitcoin-lisp peer, see handle-getdata — ever sends a
-notfound for a block, and a peer that cannot serve one it announced is
-handled by the block-download timeout like any other stalled request.
+more items we requested via getdata. Its tx items go to
+m_txdownloadman.ReceivedNotFound (net_processing.cpp:5150-5164,
+txdownloadman_impl.cpp:288-295), which completes this peer's announcement of
+each, so the next candidate is asked at the SendMessages pass that follows
+instead of the request burning its 60s expiry. Block items are ignored, as
+Core's NOTFOUND arm ignores them: no Core peer — and no bitcoin-lisp peer, see
+handle-getdata — ever sends a notfound for a block, and a peer that cannot
+serve one it announced is handled by the block-download timeout like any
+other stalled request.
 
-Two bounds on what an unsolicited notfound costs, both Core's. Its tx items
-are ignored outright when the message carries more than
-MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER of them
-(net_processing.cpp:5150-5164) — more than the peer could possibly be
-answering — rather than the 50,000 the inv parser allows. And the failover
-re-selects only the hashes this message named, so the work is the message's
-own item count; it used to re-run the whole scheduler, which walks every
-tracked announcement under the tx-relay lock. The handler also drains the
-serve bucket now: an unsolicited response message with no rate bucket at all
-was the only uncharged command on this path."
-  (declare (ignore ctx))
+The tx items are ignored outright when the message carries more than
+MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER of them -- more
+than the peer could possibly be answering -- rather than the 50,000 the inv
+parser allows. Nothing is re-requested from here: Core re-issues from each
+peer's own SendMessages, and so does SEND-TX-REQUESTS-TO-PEERS, which keeps
+an unsolicited notfound's cost at its own item count."
   (let ((invs (bl.ser:parse-inv-payload payload))
         (hashes '()))
     (when (<= (length invs)
               (+ +max-peer-tx-announcements+ +max-blocks-in-transit-per-peer+))
       (dolist (inv invs)
         (when (tx-inv-type-p (bl.ser:inv-vector-type inv))
-          (let ((hash (bl.ser:inv-vector-hash inv)))
-            (tx-request-received-response peer hash)
-            (push hash hashes)))))
-    ;; Fail over promptly: re-select the named hashes so another announcer's
-    ;; candidate is requested now rather than on the next 1s tick.
-    (when hashes
-      (process-tx-requests-for hashes))))
+          (push (bl.ser:inv-vector-hash inv) hashes))))
+    (txdownload-received-not-found (ctx-txdownloadman ctx) peer (nreverse hashes))))
 
 ;;; Headers handling
 
@@ -1450,7 +809,7 @@ committed to the index from announcements."
 ;;; Block handling
 
 (defun accept-downloaded-block (block chain-state utxo-set block-store
-                                &key mempool recent-rejects)
+                                &key mempool)
   "Validate and connect a freshly-downloaded block (full, reconstructed, or
 completed compact), handling the fork case correctly. Must be called under the
 node lock. Returns (values valid error).
@@ -1483,7 +842,6 @@ never received the branch's blocks."
              (multiple-value-bind (entry reorg-outcome)
                  (bl.val:connect-block
                   block chain-state block-store utxo-set
-                  :recent-rejects recent-rejects
                   :mempool mempool)
                (declare (ignore entry))
                ;; If CONNECT-BLOCK triggered a reorg that was REFUSED because
@@ -1626,7 +984,7 @@ announcements — Core
 drives that off mapBlockSource (net_processing.cpp:2202, 2218-2223), which is
 filled for plain block messages exactly as it is for reconstructed compact
 ones, so promotion must not be a compact-block-only privilege."
-  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool recent-rejects) ctx
+  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool) ctx
   (let ((block (bl.ser:parse-block-payload payload)))
     (when (and block (%refuse-mutated-block peer block chain-state))
       (return-from handle-block nil))
@@ -1638,8 +996,7 @@ ones, so promotion must not be a compact-block-only privilege."
                        (tip-before (bl.store:best-block-hash chain-state)))
                   (multiple-value-bind (valid error)
                       (accept-downloaded-block block chain-state utxo-set block-store
-                                               :mempool mempool
-                                               :recent-rejects recent-rejects)
+                                               :mempool mempool)
                     (cond
                       (valid
                        ;; Announcing the new tip is the :updated-block-tip
@@ -2146,102 +1503,6 @@ block-relay-only peer (Core SetupAddressRelay)."
 
 ;;; Transaction handling
 
-(alexandria:define-constant +reconsiderable-tx-failures+
-  '(:insufficient-fee :mempool-min-fee-not-met :rbf-insufficient-fee
-    :replacement-failed :mempool-full)
-  :test #'equalp :documentation "The rejection reasons Bitcoin Core classifies TX_RECONSIDERABLE — \"fails
-some policy, but might be acceptable if submitted in a (different) package\"
-(consensus/validation.h:48). Core's four sites: both fee-floor failures in
-CheckFeeRate (validation.cpp:703-711), the RBF anti-DoS fee check (:1010) —
-our :rbf-insufficient-fee — and the RBF diagram check (:1028) — our
-:replacement-failed — and \"mempool full\", i.e. a tx that self-evicted on the
-post-add trim (:1399-1402).
-
-NOT reconsiderable, and so still cached in the MAIN filter: :too-large-cluster
-(Core TX_MEMPOOL_POLICY, validation.cpp:1020-1022) — a cluster-limit failure
-is not a fee problem and a package cannot fix it.")
-
-(defun %reconsiderable-failure-p (reason)
-  "T if REASON is one Core would mark TX_RECONSIDERABLE. A verdict that
-carries Core's debug message is the list (KEYWORD DETAIL); the class is the
-KEYWORD's."
-  (and (member (if (consp reason) (first reason) reason)
-               +reconsiderable-tx-failures+)
-       t))
-
-(defun %cache-tx-rejection (tx reason recent-rejects)
-  "Core MempoolRejectedTx's caching rules, for the first_time_failure=false
-callers this node has (txdownloadman_impl.cpp:350-484):
-
-  - :missing-input is cached NOWHERE (:361-364). Core's TX_MISSING_INPUTS
-    branch does orphan INTAKE, and only when first_time_failure is true;
-    at first_time_failure=false — which is what every caller here is — the
-    whole branch is a no-op. A missing input is not a verdict on the
-    transaction: the parent may still arrive, or the pair may still be
-    submitted as a package. Caching it in the main filter would black-hole
-    the CHILD of a CPFP pair, which is the mirror of the bug the
-    reconsiderable filter exists to fix. This arm matters because a
-    package member can REACH here carrying :missing-input: a package-LEVEL
-    failure (TRUC topology, package RBF, cluster limits, ephemeral dust, or
-    the quit-early path) leaves the child's nonfinal phase-1 result
-    untouched, and Core deliberately carries that nonfinal
-    TX_MISSING_INPUTS into results_final (validation.cpp:1759-1763) so that
-    ProcessPackageResult can see it and do nothing with it.
-  - RECONSIDERABLE failures go to the SEPARATE reconsiderable filter, keyed
-    by wtxid (:454-459). They must not enter the main filter: an entry there
-    is permanent until the next block, and would black-hole the transaction
-    — the parent of a CPFP package would never be accepted, mined or
-    relayed, no matter how much fee its child brings.
-  - :witness-stripped is cached NOWHERE (:438-439): wtxid == txid for such a
-    tx, so caching would poison the TXID of the real, witnessed transaction.
-  - Everything else is cached in the main filter under the WTXID only —
-    the witness is malleable (Core issue #8279) — plus the TXID for
-    :nonstandard-inputs, a failure that depends only on the txid (:471-484).
-
-The tracker follows the same ids, and for the same reason. Core
-ForgetTxHash's the WTXID of every non-reconsiderable-or-missing-input
-failure (:470) and adds the TXID only for TX_INPUTS_NOT_STANDARD (:483-484):
-that verdict is decided by the scriptPubKey being spent, which the txid
-covers, so no witness can change it and no peer should be asked for the
-transaction again under either id. Any other failure may be a verdict on
-THIS witness alone, so the txid keeps its announcements."
-  (let ((txid (bl.ser:transaction-hash tx))
-        (wtxid (bl.ser:transaction-wtxid tx))
-        ;; The CLASS decides where a rejection is cached, and a verdict that
-        ;; carries Core's reject reason and debug message beside it is the
-        ;; list (KEYWORD DETAIL...) -- :witness-stripped is one of those, so
-        ;; asking EQ of the whole verdict would cache exactly the rejection
-        ;; Core caches nowhere.
-        (reason (bl.val:tx-reject-keyword reason)))
-    (cond
-      ((eq reason :missing-input) nil)
-      ((eq reason :witness-stripped) nil)
-      ((%reconsiderable-failure-p reason)
-       (bl.val:add-reconsiderable-reject wtxid)
-       (tx-request-received wtxid))
-      (t
-       (bl:add-recent-reject recent-rejects wtxid)
-       (tx-request-received wtxid)
-       (when (and (eq reason :nonstandard-inputs) (not (equalp wtxid txid)))
-         (bl:add-recent-reject recent-rejects txid)
-         (tx-request-received txid))))))
-
-(defun %log-invalid-orphan (txid wtxid peer-id error)
-  "Core's two lines for an orphan that turned out invalid once its parent
-arrived: ProcessOrphanTx's `   invalid orphan tx <txid> (wtxid=<wtxid>) from
-peer=<n>. <state>' (net_processing.cpp:3246-3250) and then ProcessInvalidTx's
-`<txid> (wtxid=<wtxid>) from peer=<n> was not accepted: <state>' (:3131-3135).
-p2p_invalid_tx.py:122 waits for the reject reason in them
-(`bad-txns-in-belowout'). PEER-ID is the orphan's announcer -- the peer whose
-orphan work set Core is draining."
-  (let ((state (bl.val:tx-reject-reason-string error))
-        (txid-hex (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid)))
-        (wtxid-hex (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid))))
-    (bl:log-cat "txpackages" "   invalid orphan tx ~A (wtxid=~A) from peer=~D. ~A"
-                txid-hex wtxid-hex peer-id state)
-    (bl:log-cat "mempoolrej" "~A (wtxid=~A) from peer=~D was not accepted: ~A"
-                txid-hex wtxid-hex peer-id state)))
-
 ;;; Core's vExtraTxnForCompact (net_processing.cpp:996-1003, 1885-1893): a ring
 ;;; of the last -blockreconstructionextratxn transactions a peer relayed that
 ;;; did not stay in the mempool -- rejected on first sight, or replaced -- which
@@ -2293,325 +1554,173 @@ callers): every transaction that acceptance replaces joins the ring
   (when (and *compact-extra-replaced* (eq reason :replaced))
     (add-to-compact-extra-transactions tx)))
 
-(defun %add-rejected-to-compact-extra (tx error mempool)
-  "Core ProcessInvalidTx's AddToCompactExtraTransactions for a FIRST-TIME
-failure (net_processing.cpp:3138-3141, txdownloadman_impl.cpp:354-438): not
-a witness-stripped transaction, not an orphan the orphanage already holds,
-and not one of 100,000 bytes or more of memory. Call it before the orphan
-intake, which is what makes an orphan already held."
-  (let ((reason (bl.val:tx-reject-keyword error)))
-    (when (and (not (eq reason :witness-stripped))
-               (not (and (eq reason :missing-input)
-                         (bl.mp:orphan-tx (bl.mp:mempool-orphan-pool mempool)
-                                          (bl.ser:transaction-wtxid tx))))
-               (< (bl.mp:transaction-dynamic-usage tx) 100000))
-      (add-to-compact-extra-transactions tx))))
+(defun %process-transaction (tx ctx)
+  "Core ChainstateManager::ProcessTransaction (validation.cpp:4476-4493) for a
+peer's TX: validate it against the active chainstate, admit it, and run the
+mempool check after the attempt. Returns (values result reason): result :VALID,
+:INVALID with the rejection REASON, or :MEMPOOL-ENTRY for one already in the
+pool. A transaction a peer's acceptance REPLACES joins the compact-block extra
+pool (*COMPACT-EXTRA-REPLACED*, ProcessValidTx's loop, net_processing.cpp:
+3165-3167).
 
-(defun process-orphans (accepted-txid utxo-set mempool chain-state peers
-                        &key recent-rejects)
-  "De-orphan cascade: after ACCEPTED-TXID enters the mempool, re-validate the
-orphans that depend on it; accept+relay any now valid, drop those now invalid,
-and recurse on newly-accepted txs so a parent can unblock a whole chain.
-The orphanage is wtxid-keyed (Core TxOrphanage); children reference parents
-by TXID, so the cascade work list carries txids."
-  (let ((pool (bl.mp:mempool-orphan-pool mempool))
-        (work (list accepted-txid)))
-    (loop while work do
-      (let ((ptxid (pop work)))
-        (dolist (owtxid (bl.mp:orphans-depending-on pool ptxid))
-          (let ((otx (bl.mp:orphan-tx pool owtxid)))
-            (when otx
-              (let ((otxid (bl.ser:transaction-hash otx))
-                    (current-height (bl.store:current-height chain-state)))
-                (multiple-value-bind (valid error fee replaced sigops)
-                    ;; Uncache on rejection (Core validation.cpp:1787-1790).
-                    (bl.store:with-coins-to-uncache (utxo-set)
-                      (bl.val:validate-transaction-for-mempool
-                       otx utxo-set mempool current-height :chain-state chain-state))
-                  (unless valid
-                    ;; ProcessTransaction's check for the orphan
-                    ;; (net_processing.cpp:3236, validation.cpp:4490).
-                    (bl.val:check-mempool-at-tip mempool utxo-set chain-state))
-                  (cond
-                    (valid
-                     (multiple-value-bind (result entry)
-                         (let ((*compact-extra-replaced* t))
-                           (bl.mp:accept-validated-tx
-                            mempool otxid otx fee current-height
-                            :sigops sigops :replaced replaced
-                            :chainstate-current
-                            (current-for-fee-estimation-p chain-state)))
-                       (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
-                       (when (eq :ok result)
-                         (bl:log-cat "txpackages" "   accepted orphan tx ~A (wtxid=~A)"
-                                     (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes otxid))
-                                     (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes owtxid)))
-                         (bl.mp:orphan-remove pool owtxid)
-                         (when peers
-                           (let ((vsize (bl.mp:mempool-entry-vsize entry)))
-                             (relay-transaction
-                              otxid nil peers
-                              :fee-rate-per-kvb
-                              (if (plusp vsize) (floor (* 1000 fee) vsize) 0)
-                              :wtxid owtxid)))
-                         (push otxid work))))   ; cascade to this tx's dependents
-                    ((eq error :missing-input) nil)   ; still missing another parent
-                    (t (let ((announcer (first (bl.mp:orphan-announcers pool owtxid))))
-                         (%log-invalid-orphan otxid owtxid
-                                              (if (peer-p announcer)
-                                                  (peer-id announcer)
-                                                  announcer)
-                                              error))
-                       (bl.mp:orphan-remove pool owtxid)  ; now invalid
-                       ;; Same insertion rules as handle-tx — Core routes
-                       ;; orphan re-validation failures through the same
-                       ;; MempoolRejectedTx. This is Core's
-                       ;; first_time_failure=false path, so no 1p1c retry is
-                       ;; attempted here (net_processing.cpp:3207-3211).
-                       (%cache-tx-rejection otx error recent-rejects))))))))))))
+The coins a rejected transaction pulled into the cache are uncached again
+(validation.cpp:1787-1790): a peer streaming transactions that fail after
+input fetch -- a bad signature suffices -- would otherwise leave one cache
+entry per distinct prevout until the next block, ~24,000 for a ~1 MB
+transaction."
+  (bl.ctx:with-node-context (utxo-set mempool chain-state) ctx
+    (let ((height (bl.store:current-height chain-state)))
+      (multiple-value-bind (valid error fee replaced sigops)
+          (bl.store:with-coins-to-uncache (utxo-set)
+            (bl.val:validate-transaction-for-mempool
+             tx utxo-set mempool height :chain-state chain-state))
+        (if (not valid)
+            (progn (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
+                   (values :invalid error))
+            (let ((result (let ((*compact-extra-replaced* t))
+                            (bl.mp:accept-validated-tx
+                             mempool (bl.ser:transaction-hash tx) tx fee height
+                             :sigops sigops :replaced replaced
+                             :chainstate-current (current-for-fee-estimation-p chain-state)))))
+              (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
+              ;; Admitted by validation and refused by the pool -- mempool
+              ;; full, a cluster limit, a conflict -- is a rejection like any
+              ;; other: Core's state is invalid then, and MempoolRejectedTx
+              ;; caches it (:mempool-full as reconsiderable, validation.cpp:
+              ;; 1399-1402).
+              (case result
+                (:ok (values :valid nil))
+                (:duplicate (values :mempool-entry nil))
+                (t (values :invalid result)))))))))
 
-(defun unique-parent-txids (tx)
-  "Core GetUniqueParents (txdownloadman_impl.cpp:335-347): the txids TX's
-inputs spend, deduplicated and sorted as Core sorts them (uint256 order, a
-byte-wise compare of the wire-order bytes). Nothing is filtered here; the
-callers apply AlreadyHaveTx and the rejected-parents scan."
-  (let ((parents '()))
-    (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
-      (pushnew (bl.ser:outpoint-hash (bl.ser:tx-in-previous-output input))
-               parents :test #'equalp))
-    (sort parents (lambda (a b)
-                    (let ((i (mismatch a b)))
-                      (and i (< (aref a i) (aref b i))))))))
-
-(defun request-orphan-parents (peer parent-txids &optional (num-wtxid-peers 0))
-  "Register an orphan's missing PARENT-TXIDS with the tx-request tracker as
-txid-based announcements from PEER and getdata the ones requestable now.
-Returns the list of inv-vectors sent immediately (delayed/duplicate parents
-ride the scheduler), or NIL when the whole batch was dropped by the per-peer
-cap — Core MaybeAddOrphanResolutionCandidate returns false then and no
-announcer is recorded (txdownloadman_impl.cpp:230-282). NUM-WTXID-PEERS
-drives the txid-relay delay: Core delays parent fetches whenever wtxid peers
-exist, since parents are requested by txid (:246-251).
-
-Parents are known only by TXID, so the request MUST carry the witness flag
-(MSG_TX|MSG_WITNESS_FLAG) for witness-capable peers — Core requests every
-txid-based announcement as MSG_TX | GetFetchFlags(peer)
-(net_processing.cpp:6207; orphan parents enter the tracker as
-GenTxid::Txid announcements via MaybeAddOrphanResolutionCandidate,
-txdownloadman_impl.cpp:257-260). A bare MSG_TX getdata is answered with the
-WITNESS-STRIPPED serialization: a stripped segwit parent can never pass
-script validation, and since a stripped tx's wtxid equals its txid, the
-reject path then poisoned recent-rejects with the parent's real TXID — the
-witnessed parent could never be fetched again and the orphan never resolved.
-
-Registration with the shared tracker means concurrent orphans wanting the
-same parent don't duplicate the getdata and a timed-out parent request fails
-over like any other (Core routes them through the same m_txrequest)."
-  ;; Bulk per-peer cap (Core: Count(peer) + unique_parents.size() >
-  ;; MAX_PEER_TX_ANNOUNCEMENTS drops the whole candidacy, :242).
-  (when (> (+ (tx-request-count peer) (length parent-txids))
-           +max-peer-tx-announcements+)
-    (return-from request-orphan-parents nil))
-  (let ((invs '()))
-    (dolist (ptxid parent-txids)
-      ;; Parents are txid-based announcements: Core adds TXID_RELAY_DELAY
-      ;; whenever wtxid peers exist (unconditional on the id type, :251) —
-      ;; matched here since wtxidp is NIL.
-      (when (tx-request-wanted-p ptxid peer nil num-wtxid-peers)
-        (push (tx-request-inv ptxid nil peer) invs)))
-    (setf invs (nreverse invs))
-    (when invs
-      (send-message peer (bl.ser:make-getdata-message invs)))
-    (or invs t)))
-
-;;; --- Opportunistic 1-parent-1-child package relay ---
-;;;
-;;; The reason the reconsiderable filter exists. A CPFP package (an LN
-;;; commitment transaction paying no fee of its own, plus the child that
-;;; fee-bumps it) arrives as two separate `tx` messages, and neither can be
-;;; accepted alone: the parent is under the fee floor, the child has a
-;;; missing input. Core pairs them up opportunistically — the parent's
-;;; reconsiderable failure triggers a search of the orphanage for a child
-;;; that spends it, and the two are submitted together through the ordinary
-;;; package-validation path (net_processing.cpp:4523-4527, :4543-4547).
-
-(defun %after-mempool-accept (tx peer peers utxo-set mempool chain-state
-                              recent-rejects)
-  "The shared tail for a transaction that has just entered the mempool from
-the P2P path (Core ProcessValidTx -> MempoolAcceptedTx,
-txdownloadman_impl.cpp:323-333): forget every peer's request for it, forget
-it as an orphan, relay it, and run the de-orphan cascade over the children
-waiting on it. PEER is the source, excluded from relay."
-  (let ((txid (bl.ser:transaction-hash tx))
-        (wtxid (bl.ser:transaction-wtxid tx)))
-    ;; "As this version of the transaction was acceptable, we can forget about
-    ;; any requests for it" (:325-328): ForgetTxHash under BOTH ids, which is
-    ;; the point at which the transaction is genuinely resolved and every
-    ;; announcer's slot may be released. A no-op if it was never tracked.
-    (tx-request-forget-tx txid wtxid)
-    ;; It may have been in our orphanage (announced by another peer, or held
-    ;; while a parent was fetched); Core's EraseTx is a no-op otherwise.
-    (bl.mp:orphan-remove
-     (bl.mp:mempool-orphan-pool mempool) wtxid)
-    ;; The entry carries the fee and the sigop-adjusted vsize the feefilter
-    ;; gate needs; read it from the pool rather than threading it, so the
-    ;; package path (which has no entry in hand) shares this tail.
-    (let ((entry (and peers (bl.mp:mempool-get mempool txid))))
-      (when entry
+(defun process-valid-tx (peer tx ctx)
+  "Core ProcessValidTx (net_processing.cpp:3149-3168): TX from PEER entered
+the mempool. m_txdownloadman.MempoolAcceptedTx forgets every request for it
+and puts the orphans spending it into their announcers' work sets; then it is
+relayed, at the fee rate its pool entry carries, to every peer but PEER."
+  (bl.ctx:with-node-context (mempool peers) ctx
+    (let* ((txid (bl.ser:transaction-hash tx))
+           (wtxid (bl.ser:transaction-wtxid tx))
+           (entry (bl.mp:mempool-get mempool txid)))
+      (txdownload-mempool-accepted-tx (ctx-txdownloadman ctx) tx)
+      (bl:log-cat "mempool" "AcceptToMemoryPool: peer=~D: accepted ~A (wtxid=~A) (poolsz ~D txn, ~D kB)"
+                  (%tx-peer-node-id peer) (%tx-hex txid) (%tx-hex wtxid)
+                  (bl.mp:mempool-count mempool)
+                  (floor (bl.mp:mempool-dynamic-usage mempool) 1000))
+      (when (and entry peers)
         (let ((vsize (bl.mp:mempool-entry-vsize entry))
               (fee (bl.mp:mempool-entry-fee entry)))
           (relay-transaction txid peer peers
-                             :fee-rate-per-kvb
-                             (if (plusp vsize) (floor (* 1000 fee) vsize) 0)
-                             :wtxid wtxid))))
-    (process-orphans txid utxo-set mempool chain-state peers
-                     :recent-rejects recent-rejects)))
+                             :fee-rate-per-kvb (if (plusp vsize) (floor (* 1000 fee) vsize) 0)
+                             :wtxid wtxid))))))
 
-(defun %find-1p1c-package (peer parent-tx mempool recent-rejects)
-  "Core Find1P1CPackage (txdownloadman_impl.cpp:297-321): the newest orphan
-announced BY PEER that spends PARENT-TX and whose pairing with it is not
-already known to fail — the package hash in the reconsiderable filter, or
-the child's TXID in the main rejects filter. Returns the child transaction,
-or NIL when there is no eligible candidate."
-  (let ((pool (bl.mp:mempool-orphan-pool mempool)))
-    (dolist (child (bl.mp:orphan-children-from-peer
-                    pool parent-tx peer))
-      (unless (or (bl.val:reconsiderable-reject-p
-                   (bl.val:package-hash (list parent-tx child)))
-                  (bl:recent-reject-p
-                   recent-rejects
-                   (bl.ser:transaction-hash child)))
-        (return child)))))
+(defun process-invalid-tx (peer tx reason first-time-failure ctx)
+  "Core ProcessInvalidTx (net_processing.cpp:3122-3147): TX from PEER was
+refused for REASON. The line Core logs for every refusal comes first
+(p2p_permissions.py:133-138 greps it); m_txdownloadman.MempoolRejectedTx then
+records the verdict, and its todo is carried out here: a first-time failure
+under 100,000 bytes joins the compact-block extra pool, and the orphan's
+missing parents are marked known to PEER -- it just sent a child spending
+them, so announcing them back is wasted egress. Returns the 1p1c
+PACKAGE-TO-VALIDATE the manager found, or NIL."
+  (bl:log-cat "mempoolrej" "~A (wtxid=~A) from peer=~D was not accepted: ~A"
+              (%tx-hex (bl.ser:transaction-hash tx))
+              (%tx-hex (bl.ser:transaction-wtxid tx))
+              (%tx-peer-node-id peer)
+              (bl.val:tx-reject-reason-string reason))
+  (multiple-value-bind (add-extra parents package)
+      (txdownload-mempool-rejected-tx (ctx-txdownloadman ctx)
+                                      tx reason peer first-time-failure)
+    (when (and add-extra (< (bl.mp:transaction-dynamic-usage tx) 100000))
+      (add-to-compact-extra-transactions tx))
+    ;; Always by TXID: an orphan's parents are known only by txid, which is
+    ;; why Core writes parent_txid into a filter that is otherwise
+    ;; wtxid-keyed for a wtxidrelay peer.
+    (when (peer-p peer)
+      (dolist (parent parents)
+        (%mark-tx-known-to-peer peer parent)))
+    package))
 
-(defun %try-1p1c-package (peer parent-tx utxo-set mempool chain-state peers
-                          recent-rejects)
-  "PARENT-TX failed on its own for a reconsiderable reason: look for a child
-of it in the orphanage and submit the pair as a package (Core's
-ProcessNewPackage + ProcessPackageResult, net_processing.cpp:3170-3220).
-Returns T if a package was submitted.
+(defun process-package-result (ptv msg results ctx)
+  "Core ProcessPackageResult (net_processing.cpp:3170-3220) for the 1p1c
+package PTV, which ProcessNewPackage answered with MSG and the per-transaction
+RESULTS (package order). A package that failed is remembered by its hash
+(m_txdownloadman.MempoolRejectedPackage), so the same pairing is not
+validated again on every re-announcement. The members are walked CHILD
+FIRST, so an in-package descendant leaves the orphanage before its parent's
+acceptance could put it in a work set; an accepted member takes
+ProcessValidTx, a refused or different-witness one ProcessInvalidTx at
+first_time_failure=false -- no orphan intake, no further 1p1c, and a child
+still missing an input (the nonfinal phase-1 verdict a package-LEVEL failure
+leaves it, validation.cpp:1759-1763) is cached nowhere and stays an orphan.
+A member with no result -- a context-free package check failed first -- is
+skipped, as Core's `it_result != end()' guard skips it."
+  (unless (eq msg :success)
+    (txdownload-mempool-rejected-package
+     (ctx-txdownloadman ctx) (ptv-txns ptv)))
+  (loop for tx in (reverse (ptv-txns ptv))
+        for sender in (list (ptv-child-sender ptv) (ptv-parent-sender ptv))
+        for res in (reverse results)
+        do (case (bl.val:package-tx-result-status res)
+             (:valid (process-valid-tx sender tx ctx))
+             ;; A DIFFERENT_WITNESS result carries a default-constructed
+             ;; (TX_RESULT_UNSET) state (validation.h:228-229), which
+             ;; MempoolRejectedTx caches in the main filter by wtxid.
+             ((:invalid :different-witness)
+              (process-invalid-tx sender tx (bl.val:package-tx-result-error res) nil ctx))
+             (otherwise nil))))
 
-Result handling mirrors ProcessPackageResult exactly: a package-level
-failure is remembered by package hash so the same combination is not
-re-validated on every re-announcement; members are walked CHILD FIRST, so
-an in-package descendant leaves the orphanage before the parent's de-orphan
-cascade could pick it up again; an accepted member takes the ordinary
-accept tail; and a member that failed is cached under Core's
-first_time_failure=false rules — no orphan intake, no further 1p1c.
+(defun %process-new-package (ptv ctx)
+  "Core's ProcessNewPackage + ProcessPackageResult pair the TX handler runs
+for a 1p1c package (net_processing.cpp:4523-4527, :4543-4547)."
+  (bl.ctx:with-node-context (utxo-set mempool chain-state) ctx
+    (multiple-value-bind (msg results)
+        (let ((*compact-extra-replaced* t))
+          (bl.val:validate-package-for-mempool (ptv-txns ptv) utxo-set mempool chain-state))
+      (bl:log-cat "txpackages" "package evaluation for parent ~A (wtxid=~A, sender=~D) + child ~A (wtxid=~A, sender=~D): ~:[package rejected~;package accepted~]"
+                  (%tx-hex (bl.ser:transaction-hash (ptv-parent ptv)))
+                  (%tx-hex (bl.ser:transaction-wtxid (ptv-parent ptv)))
+                  (%tx-peer-node-id (ptv-parent-sender ptv))
+                  (%tx-hex (bl.ser:transaction-hash (ptv-child ptv)))
+                  (%tx-hex (bl.ser:transaction-wtxid (ptv-child ptv)))
+                  (%tx-peer-node-id (ptv-child-sender ptv))
+                  (eq msg :success))
+      (process-package-result ptv msg results ctx))))
 
-Note the CHILD of a package that failed a PACKAGE-LEVEL check still carries
-its nonfinal phase-1 :missing-input result, which under those rules is
-cached NOWHERE and does not even leave the orphanage. Caching it would
-black-hole an honest CPFP child after a single lost package attempt."
-  (let ((child (%find-1p1c-package peer parent-tx mempool recent-rejects)))
-    (when child
-      (let ((package (list parent-tx child)))
-        (multiple-value-bind (msg results)
-            (let ((*compact-extra-replaced* t))
-              (bl.val:validate-package-for-mempool
-               package utxo-set mempool chain-state))
-          (bl:log-cat "mempool" "1p1c package evaluation: ~A" msg)
-          (unless (eq msg :success)
-            (bl.val:add-reconsiderable-reject
-             (bl.val:package-hash package)))
-          ;; RESULTS is in package order; walk it backwards.
-          (loop for tx in (reverse package)
-                for res in (reverse results)
-                do (let ((err (bl.val:package-tx-result-error res)))
-                     (case (bl.val:package-tx-result-status res)
-                       (:valid
-                        (%after-mempool-accept tx peer peers utxo-set mempool
-                                               chain-state recent-rejects))
-                       ;; Core routes INVALID and DIFFERENT_WITNESS through the
-                       ;; same ProcessInvalidTx (net_processing.cpp:3204-3212).
-                       ;; A DIFFERENT_WITNESS result carries a
-                       ;; default-constructed (TX_RESULT_UNSET) state
-                       ;; (validation.h:228-229), so MempoolRejectedTx's final
-                       ;; else caches its wtxid in the main filter — which is
-                       ;; what %CACHE-TX-REJECTION does for a NIL reason.
-                       ((:invalid :different-witness)
-                        ;; :missing-input is cached nowhere and does NOT leave
-                        ;; the orphanage: a package-LEVEL failure leaves the
-                        ;; child's nonfinal phase-1 result untouched, and Core
-                        ;; deliberately does nothing with it here
-                        ;; (txdownloadman_impl.cpp:361-364, :489-492).
-                        (%cache-tx-rejection tx err recent-rejects)
-                        (unless (eq err :missing-input)
-                          (bl.mp:orphan-remove
-                           (bl.mp:mempool-orphan-pool mempool)
-                           (bl.ser:transaction-wtxid tx))))
-                       ;; :not-validated — a context-free package check
-                       ;; (well-formedness, child-with-parents) failed before
-                       ;; any member was processed. Core's ProcessNewPackage
-                       ;; returns no per-tx results at all in that case and
-                       ;; ProcessPackageResult's `it_result != end()` guard
-                       ;; skips them, so nothing is cached: deliberate.
-                       (otherwise nil))))
-          t)))))
-
-(defun %orphan-resolution-candidates (peer txid wtxid)
-  "The delivering PEER, then every OTHER peer with a live announcement of the
-orphan by txid or -- when it has a witness -- by wtxid. Core's
-orphan_resolution_candidates: it starts as {nodeid} and is extended by
-m_txrequest.GetCandidatePeers over both ids (txdownloadman_impl.cpp:406-410).
-
-Starting with the delivering peer alone left orphan resolution with ONE
-candidate: a peer announces a transaction once, so the peers that announced
-this orphan before it reached us never offer themselves again, and if the
-sole candidate stalls the parent request dies at the 60s expiry with no
-alternative announcer."
-  (let ((candidates (list peer)))
-    (dolist (hash (if (equalp wtxid txid) (list txid) (list txid wtxid)))
-      (dolist (p (tx-request-candidate-peers hash))
-        (pushnew p candidates :test #'eq)))
-    (nreverse candidates)))
-
-(defun %take-orphan-into-orphanage (peer tx mempool recent-rejects peers)
-  "Core MempoolRejectedTx's orphan branch (txdownloadman_impl.cpp:391-420) in
-its order: filter the missing parents through AlreadyHaveTx, enrol EVERY
-announcer of the orphan as a resolution candidate rather than only the peer
-that delivered it, and only then ForgetTxHash the orphan under both ids --
-\"once added to the orphan pool, a tx is considered AlreadyHave, and we
-shouldn't request it anymore\" (:418-419). The order is what makes the
-enrolment possible at all: forgetting the hash at receipt, as this used to,
-left GetCandidatePeers nothing to find."
-  (let* ((txid (bl.ser:transaction-hash tx))
-         (wtxid (bl.ser:transaction-wtxid tx))
-         (parents (%orphan-missing-parents tx mempool recent-rejects))
-         (num-wtxid-peers (count-wtxid-relay-peers peers)))
-    ;; The delivering peer knows the parents: it just sent us a child that
-    ;; spends them, so announcing them back to it is wasted egress (Core
-    ;; ProcessInvalidTx, net_processing.cpp:3141-3143, over exactly this
-    ;; already-filtered unique_parents list). Always by TXID on both sides --
-    ;; an orphan's parents are known only by txid, which is why Core writes
-    ;; parent_txid.ToUint256() into a filter that is otherwise wtxid-keyed for
-    ;; a wtxidrelay peer.
-    (dolist (ptxid parents)
-      (bl:add-recent-reject (peer-announced-txs peer) ptxid))
-    (dolist (candidate (%orphan-resolution-candidates peer txid wtxid))
-      (%add-orphan-resolution-candidate candidate tx parents mempool
-                                        num-wtxid-peers))
-    (tx-request-forget-tx txid wtxid)))
-
-(defun %orphan-parents-rejected-p (parent-txids mempool recent-rejects)
-  "Core's fRejectedParents scan (txdownloadman_impl.cpp:371-396): T when an
-orphan with these unique PARENT-TXIDS must not be kept at all.
-
-A parent in the MAIN rejects filter is fatal — no witness and no package can
-make this child acceptable. A parent in the RECONSIDERABLE filter is NOT: it
-may be precisely the low-feerate parent this child exists to fee-bump. Core
-tolerates exactly ONE such parent, because it only submits 1-parent-1-child
-packages, so a second one could never be rescued.
-
-A reconsiderable parent that has since entered MEMPOOL does not count
-(Core's `!m_opts.m_mempool.exists(parent_txid)`)."
-  (let ((reconsiderable 0))
-    (dolist (ptxid parent-txids nil)
-      (cond ((bl:recent-reject-p recent-rejects ptxid)
-             (return t))
-            ((and (bl.val:reconsiderable-reject-p ptxid)
-                  (not (bl.mp:mempool-has mempool ptxid)))
-             (when (> (incf reconsiderable) 1)
-               (return t)))))))
+(defun process-orphan-tx (peer ctx)
+  "Core ProcessOrphanTx (net_processing.cpp:3227-3263): take the orphans in
+PEER's work set one at a time (m_txdownloadman.GetTxToReconsider) until one of
+them is resolved -- accepted, or refused for something other than a missing
+input -- and return T, or NIL when the work set ran dry. One resolution per
+call is the point: the message loop interleaves it with the peer's messages,
+so a parent cannot buy a cascade of re-validations inside one message (\"the
+orphan processing used to be uninterruptible and quadratic, which could allow
+a peer to stall the node for hours\", :3229-3230). An orphan still missing an
+input stays in the orphanage, out of the work set until another parent
+arrives."
+  (bl.ctx:with-node-context (mempool) ctx
+    (when mempool
+      (with-current-node-lock
+        (loop for orphan = (txdownload-get-tx-to-reconsider (ctx-txdownloadman ctx) peer)
+              while orphan
+              do (multiple-value-bind (result reason) (%process-transaction orphan ctx)
+                   (case result
+                     (:valid
+                      (bl:log-cat "txpackages" "   accepted orphan tx ~A (wtxid=~A)"
+                                  (%tx-hex (bl.ser:transaction-hash orphan))
+                                  (%tx-hex (bl.ser:transaction-wtxid orphan)))
+                      (process-valid-tx peer orphan ctx)
+                      (return t))
+                     (:invalid
+                      (unless (eq (bl.val:tx-reject-keyword reason) :missing-input)
+                        (bl:log-cat "txpackages" "   invalid orphan tx ~A (wtxid=~A) from peer=~D. ~A"
+                                    (%tx-hex (bl.ser:transaction-hash orphan))
+                                    (%tx-hex (bl.ser:transaction-wtxid orphan))
+                                    (%tx-peer-node-id peer)
+                                    (bl.val:tx-reject-reason-string reason))
+                        (process-invalid-tx peer orphan reason nil ctx)
+                        (return t)))))
+              finally (return nil))))))
 
 (defun %force-relay-known-tx (peer txid wtxid mempool peers)
   "Core's ForceRelay arm of the TX handler (net_processing.cpp:4509-4521): a
@@ -2637,28 +1746,35 @@ the first."
                                :wtxid wtxid))))))
 
 (define-p2p-handler ("tx" :needs-mempool t) (peer payload ctx)
-  "Handle a tx message. Validate, add to mempool, and relay.
-CTX's recent-rejects, when present, caches recently rejected txs.
+  "Handle a tx message -- Core's TX branch of ProcessMessage
+(net_processing.cpp:4473-4552), in its order: the RejectIncomingTxs and IBD
+gates, the parse, AddKnownTx, the private-broadcast check, then
+m_txdownloadman.ReceivedTx's verdict. Something it already has is not
+validated (a ForceRelay peer's copy is relayed onward if it is in the pool),
+and one known to fail reconsiderably may be retried as a 1p1c package with an
+orphan child; everything else goes to ProcessTransaction and then
+ProcessValidTx or ProcessInvalidTx(first_time_failure=true) -- which, for a
+reconsiderable failure, may hand back a package to try at once.
 
 There is no per-peer tx count limit: Core never disconnects a peer for the
-NUMBER of transactions it sends, solicited or not (the TX handler,
-net_processing.cpp:4473-4552, has no such arm). A token bucket we used to
+NUMBER of transactions it sends, solicited or not. A token bucket we used to
 charge here disconnected a peer at its 51st transaction -- first for every tx
 message (feature_fee_estimation.py:283-291 lost its relaying peer), then for
 unsolicited ones only, which still cut off p2p_opportunistic_1p1c.py:557's
 single DoSy peer mid-flood, and the orphans it had announced went with it.
 What bounds an unsolicited flood is what bounds it in Core: the orphanage's
-per-peer DoS scores (LimitOrphans) and the rejects filters."
-  (bl.ctx:with-node-context (utxo-set mempool chain-state peers recent-rejects) ctx
+per-peer DoS scores (LimitOrphans) and the rejects filters. Nor is a
+transaction that fails validation misbehavior: Core removed tx-relay
+punishment (PR #26294), since validity is subjective to our mempool and
+chain; consensus-invalid transactions are punished only inside a block."
+  (bl.ctx:with-node-context (mempool chain-state peers) ctx
   ;; A tx sent where we advertised fRelay=0 (-blocksonly / relay-disabled
   ;; mainnet default, block-relay/feeler conns) violates the protocol:
   ;; disconnect (Core RejectIncomingTxs gate in the TX handler,
-  ;; net_processing.cpp:4474-4479).
-  ;; A peer holding the "relay" permission may send us transactions even in
-  ;; -blocksonly (Core RejectIncomingTxs, net_processing.cpp:5686-5694 — the
-  ;; permission excuses the -blocksonly clause and ONLY that clause; a
-  ;; block-relay-only or feeler connection may never send txs whatever its
-  ;; permissions).
+  ;; net_processing.cpp:4474-4479). A peer holding the "relay" permission may
+  ;; send us transactions even in -blocksonly (Core RejectIncomingTxs,
+  ;; net_processing.cpp:5686-5694 — the permission excuses the -blocksonly
+  ;; clause and ONLY that clause).
   (when (reject-incoming-txs-p peer)
     (bl:log-cat "net" "transaction sent in violation of protocol, ~A"
                 (disconnect-msg peer))
@@ -2669,12 +1785,7 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
   ;; transactions is not considered a protocol violation, so don't punish the
   ;; peer" (net_processing.cpp:4479-4483) — before the parse, and with no
   ;; reject reason, no rejects-cache entry and no orphan intake, exactly as
-  ;; Core returns there. This is the same predicate the inv half of the gate
-  ;; already calls (handle-inv gates AddTxAnnouncement on it), so the two
-  ;; halves of one Core rule cannot drift apart again: without it a peer could
-  ;; make us validate a transaction against a UTXO view at a stale height,
-  ;; admit the result, announce it onward, and cache a wrong reject in the
-  ;; MAIN rejects filter, which the end of IBD does not clear.
+  ;; Core returns there. The same predicate gates the inv half.
   (when (initial-block-download-p chain-state)
     (return-from handle-tx nil))
   ;; No catch here: Core deserializes the transaction inside ProcessMessage
@@ -2682,183 +1793,42 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
   ;; undecodable one -- an unknown witness flag is `Unknown transaction
   ;; optional data' (primitives/transaction.h:235) -- reaches ProcessMessages'
   ;; catch, which logs it and keeps the peer (SAFELY-DISPATCH-PEER-MESSAGE).
-  ;; p2p_segwit.py:1984 waits for that line; ours was swallowed here.
+  ;; p2p_segwit.py:1984 waits for that line.
   (let ((tx (bl.ser:parse-tx-payload payload)))
     (when tx
       (with-current-node-lock
         (let ((txid (bl.ser:transaction-hash tx))
-              (wtxid (bl.ser:transaction-wtxid tx))
-              (current-height (bl.store:current-height chain-state)))
-          ;; A response arrived from THIS peer — Core ReceivedTx's first
-          ;; act (txdownloadman_impl.cpp:505-513). ReceivedResponse, not
-          ;; ForgetTxHash: only the delivering peer's announcement
-          ;; completes, and every other announcer stays a candidate.
-          ;; Forgetting the hash here instead let any peer evict every
-          ;; honest announcer of a TXID by sending one unsolicited
-          ;; witness-malleated twin -- same txid, different wtxid, so the
-          ;; twin is rejected and cached under its own wtxid while the
-          ;; real transaction is neither in the mempool nor requestable
-          ;; any more. MSG_WTX announcements are tracked under the wtxid,
-          ;; so answer that key too (txids and wtxids never collide; for
-          ;; no-witness txs they are equal and one call suffices).
-          (tx-request-received-response peer txid)
-          (unless (equalp wtxid txid)
-            (tx-request-received-response peer wtxid))
-          ;; The peer knows this transaction: it just sent it to us.
-          ;; Core AddKnownTx(peer, peer.m_wtxid_relay ? wtxid : txid),
-          ;; net_processing.cpp:4491-4492 -- the filter is keyed by the
-          ;; id THIS peer's inventory uses, which is what the relay path
-          ;; looks up.
+              (wtxid (bl.ser:transaction-wtxid tx)))
+          ;; The peer knows this transaction: it just sent it to us. Core
+          ;; AddKnownTx(peer, peer.m_wtxid_relay ? wtxid : txid),
+          ;; net_processing.cpp:4491-4492 -- keyed by the id THIS peer's
+          ;; inventory uses, which is what the relay path looks up.
           (%mark-tx-known-to-peer peer (%peer-inv-hash peer txid wtxid))
-          ;; One of ours we are broadcasting privately came back from
-          ;; the network: stop (net_processing.cpp:4494-4503).
+          ;; One of ours we are broadcasting privately came back from the
+          ;; network: stop (net_processing.cpp:4494-4503).
           (note-own-tx-received-back peer tx)
-          ;; A transaction we ALREADY HAVE, from a peer holding
-          ;; ForceRelay: relay it onward anyway. Core's ReceivedTx answers
-          ;; should_validate=false for anything AlreadyHaveTx knows -- the
-          ;; mempool among its sources -- and the ForceRelay arm that
-          ;; follows exists so "the node can function as a gateway for
-          ;; nodes hidden behind it" (net_processing.cpp:4508-4521); it
-          ;; relays when the transaction is in the mempool and says so
-          ;; when it is not. Ours parsed the permission and read it
-          ;; nowhere, so p2p_permissions.py:121-123 -- a forcerelay peer
-          ;; re-sending a transaction node1 already holds, asserting node0
-          ;; receives it -- waited out its sixty seconds.
-          (when (and (peer-has-permission-p peer +perm-force-relay+)
-                     (%already-have-tx-p wtxid t mempool recent-rejects))
-            (%force-relay-known-tx peer txid wtxid mempool peers)
-            (return-from handle-tx nil))
-          ;; Check recent rejects and recently-confirmed before expensive
-          ;; validation (Core's AlreadyHaveTx at tx receipt). The rejects
-          ;; filter is wtxid-keyed (Core m_lazy_recent_rejects); txid
-          ;; entries exist only where Core adds them too, so check both
-          ;; ids. Freshly-confirmed txs (still relaying through the
-          ;; network) are dropped without being treated as rejects.
-          (when (or (bl:recent-reject-p recent-rejects wtxid)
-                    (bl:recent-reject-p recent-rejects txid)
-                    (bl.val:recently-confirmed-p wtxid)
-                    (bl.val:recently-confirmed-p txid))
-            (return-from handle-tx nil))
-          ;; Already known to fail RECONSIDERABLY (too-low feerate, RBF
-          ;; economics, mempool full): do not submit it alone again — but
-          ;; it may succeed paired with a child we are already holding as
-          ;; an orphan, which is how a CPFP package whose two halves
-          ;; arrive separately gets assembled (Core ReceivedTx's second
-          ;; branch, txdownloadman_impl.cpp:544-551).
-          (when (bl.val:reconsiderable-reject-p wtxid)
-            (%try-1p1c-package peer tx utxo-set mempool chain-state peers
-                               recent-rejects)
-            (return-from handle-tx nil))
-          ;; Validate for mempool. THE hot path for this fix: a peer
-          ;; streaming transactions that fail after input fetch -- a bad
-          ;; signature suffices -- otherwise leaves one cache entry per
-          ;; distinct prevout, with no eviction until the next block. A
-          ;; ~1 MB transaction can name ~24,000 outpoints, so the
-          ;; amplification is several times the bandwidth and is held for
-          ;; a whole inter-block interval (Core validation.cpp:1787-1790).
-          (multiple-value-bind (valid error fee replaced sigops)
-              (bl.store:with-coins-to-uncache (utxo-set)
-                (bl.val:validate-transaction-for-mempool
-                 tx utxo-set mempool current-height :chain-state chain-state))
-            (unless valid
-              ;; ProcessTransaction's check (validation.cpp:4490) -- the
-              ;; pool is unchanged by a rejection, so here is as good as
-              ;; right after the attempt.
-              (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
-              ;; Core logs every rejection a peer's transaction earns,
-              ;; before any of the caching decisions below: ProcessInvalidTx
-              ;; opens with LogDebug(BCLog::MEMPOOLREJ, "%s (wtxid=%s) from
-              ;; peer=%d was not accepted: %s", txid, wtxid, nodeid,
-              ;; state.ToString()) (net_processing.cpp:3131-3135). We logged
-              ;; nothing at all here, and p2p_permissions.py:133-138 greps
-              ;; for exactly that line.
-              (bl:log-cat "mempoolrej" "~A (wtxid=~A) from peer=~D was not accepted: ~A"
-                          (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
-                          (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid))
-                          (peer-id peer)
-                          (bl.val:tx-reject-reason-string error))
-              ;; A first-time failure joins the compact-block extra pool
-              ;; (ProcessInvalidTx, net_processing.cpp:3138-3141) -- decided
-              ;; before the orphan intake below.
-              (%add-rejected-to-compact-extra tx error mempool)
-              (cond
-                ;; Missing inputs => hold as an orphan (not a real reject);
-                ;; a later parent will trigger re-evaluation. Request the
-                ;; missing parents from this peer so they arrive sooner.
-                ;; UNLESS the parents make the orphan hopeless
-                ;; (%orphan-parents-rejected-p): then reject it outright —
-                ;; under BOTH ids, exactly like Core's "not keeping orphan
-                ;; with rejected parents" (txdownloadman_impl.cpp:422-436;
-                ;; the txid too, so non-wtxidrelay peers can't make us
-                ;; re-download it).
-                ((eq error :missing-input)
-                 (let ((parents (unique-parent-txids tx)))
-                   (if (%orphan-parents-rejected-p parents mempool recent-rejects)
-                       (progn
-                         ;; Core's line (:423-425); p2p_invalid_tx.py:153
-                         ;; waits for it.
-                         (bl:log-cat "mempool" "not keeping orphan with rejected parents ~A (wtxid=~A)"
-                                     (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
-                                     (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid)))
-                         (bl:add-recent-reject recent-rejects txid)
-                         (bl:add-recent-reject recent-rejects wtxid)
-                         ;; :434-435, beside the two filter inserts.
-                         (tx-request-forget-tx txid wtxid))
-                       (%take-orphan-into-orphanage
-                        peer tx mempool recent-rejects peers))))
-                (t
-                 ;; Cache the failure so we don't re-request it (see
-                 ;; %cache-tx-rejection for which filter and which ids).
-                 ;; A loose transaction that fails validation is NOT
-                 ;; misbehavior: Bitcoin Core removed tx-relay punishment
-                 ;; (PR #26294), since tx validity is subjective (our
-                 ;; mempool/chain state) and an honest peer shouldn't be
-                 ;; discouraged for relaying a tx we happen to reject.
-                 ;; Consensus-invalid txs are only punished inside a block.
-                 (%cache-tx-rejection tx error recent-rejects)
-                 ;; A FIRST-TIME reconsiderable failure is where Core looks
-                 ;; for a child in the orphanage and retries the pair as a
-                 ;; package (txdownloadman_impl.cpp:460-465).
-                 (when (%reconsiderable-failure-p error)
-                   (%try-1p1c-package peer tx utxo-set mempool chain-state
-                                      peers recent-rejects)))))
-            (when valid
-              (let ((result (let ((*compact-extra-replaced* t))
-                              (bl.mp:accept-validated-tx
-                               mempool txid tx fee current-height
-                               :sigops sigops :replaced replaced
-                               :chainstate-current
-                               (current-for-fee-estimation-p chain-state)))))
-                ;; ProcessTransaction's check, before the result is acted
-                ;; on (validation.cpp:4490, net_processing.cpp:4535).
-                (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
-                (cond
-                  ((eq result :ok)
-                   ;; getpeerinfo "last_transaction" (Core m_last_tx_time,
-                   ;; stamped only on mempool ACCEPTANCE,
-                   ;; net_processing.cpp:4540).
-                   (setf (peer-last-tx-time peer)
-                         (bl.ser:get-unix-time))
-                   ;; Relay, de-orphan, cascade.
-                   (%after-mempool-accept tx peer peers utxo-set mempool
-                                          chain-state recent-rejects))
-                  ;; The tx passed validation but the mempool refused it.
-                  ;; Core reports these through the same MempoolRejectedTx
-                  ;; path as any other failure, so they are cached like
-                  ;; one: :mempool-full is reconsiderable — the tx
-                  ;; self-evicted on the trim and a package could still
-                  ;; carry it (validation.cpp:1399-1402) — while
-                  ;; :too-large-cluster and :conflict go to the main
-                  ;; filter. Uncached, every re-announcement was
-                  ;; re-downloaded and fully re-validated.
-                  ((eq result :duplicate) nil)   ; we already have it
-                  (t
-                   (%add-rejected-to-compact-extra tx result mempool)
-                   (%cache-tx-rejection tx result recent-rejects)
-                   (when (%reconsiderable-failure-p result)
-                     (%try-1p1c-package peer tx utxo-set mempool
-                                        chain-state peers
-                                        recent-rejects)))))))))))))
+          (multiple-value-bind (should-validate package)
+              (txdownload-received-tx (ctx-txdownloadman ctx) peer tx)
+            (unless should-validate
+              ;; A ForceRelay peer's copy of something we already have is
+              ;; relayed onward anyway, so \"the node can function as a
+              ;; gateway for nodes hidden behind it\" (:4508-4521).
+              (when (peer-has-permission-p peer +perm-force-relay+)
+                (%force-relay-known-tx peer txid wtxid mempool peers))
+              (when package
+                (%process-new-package package ctx))
+              (return-from handle-tx nil))
+            (multiple-value-bind (result reason) (%process-transaction tx ctx)
+              (case result
+                (:valid
+                 (process-valid-tx peer tx ctx)
+                 ;; getpeerinfo "last_transaction" (Core m_last_tx_time,
+                 ;; stamped only on ACCEPTANCE, net_processing.cpp:4540).
+                 (setf (peer-last-tx-time peer) (bl.ser:get-unix-time)))
+                (:invalid
+                 (let ((package (process-invalid-tx peer tx reason t ctx)))
+                   (when package
+                     (%process-new-package package ctx)))))))))))))
 
 (defconstant +stale-relay-age-limit+ (* 30 24 60 60)
   "Core STALE_RELAY_AGE_LIMIT (net_processing.cpp:117): a block NOT on the
@@ -4519,7 +3489,7 @@ unbroadcast set.")
 
 (defun reset-initial-broadcast-schedule ()
   "ARM the re-announcement deadline a full interval out (called at node
-start, alongside reset-tx-requests), as Core's PeerManager schedules the
+start, alongside reset-compact-extra-transactions), as Core's PeerManager schedules the
 first pass from StartScheduledTasks (net_processing.cpp:2036-2038) -- before
 any RPC can run. Left to the first idle tick, as it was, a mockscheduler that
 reached the node before that tick found nothing armed, and the tick then armed
@@ -5472,7 +4442,7 @@ that is accepted settles EVERY peer's request for it -- RemoveBlockRequest(hash,
 nullopt) -- so the other peers racing to complete the same block are told
 nothing more and their late blocktxn is one we were not expecting. CONTEXT
 names the path in the failure log. Returns T when the block connected."
-  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool recent-rejects) ctx
+  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool) ctx
     (increment-compact-block-success)
     ;; A rebuilt block is a block delivery from this peer: stamps getpeerinfo
     ;; "last_block" and resets stall tracking.
@@ -5482,8 +4452,7 @@ names the path in the failure log. Returns T when the block connected."
               (let ((tip-before (bl.store:best-block-hash chain-state)))
                 (multiple-value-bind (valid error)
                     (accept-downloaded-block block chain-state utxo-set block-store
-                                             :mempool mempool
-                                             :recent-rejects recent-rejects)
+                                             :mempool mempool)
                   (cond
                     (valid
                      (remove-block-request block-hash)

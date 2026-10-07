@@ -1044,17 +1044,17 @@ filter at all (net_processing.cpp:2089)."
                       1))
              (marker-cb (bl.ser:transaction-hash
                          (first (bl.ser:bitcoin-block-transactions marker)))))
-        (bl.val:reset-recent-confirmed)
+        (clear-recent-confirmed)
         (bl.val:note-block-connected marker)
-        (bl.val:note-block-txs-confirmed marker)
+        (bl.net:txdownload-block-connected (test-txdownloadman) marker)
         (when targeted
           (bl.store:set-chainstate-target chain-state fork-tip))
         (let ((reorged (bl.val:perform-reorg chain-state block-store utxo-set
                                              old-tip fork-tip)))
           (list :reorged (and reorged t)
                 :height (bl.store:current-height chain-state)
-                :filter-reset (not (bl.val:recently-confirmed-p marker-cb))
-                :fork-tip-confirmed (and (bl.val:recently-confirmed-p fork-cb) t)
+                :filter-reset (not (recently-confirmed-p marker-cb))
+                :fork-tip-confirmed (and (recently-confirmed-p fork-cb) t)
                 :fork-tip-servable (and (bl.val:most-recent-block-tx fork-cb) t))))))))
 
 (test reorg-commit-carries-the-background-chainstate-guard
@@ -1723,11 +1723,13 @@ recent-rejects filter — Core resets it on EVERY active tip change
 (ActiveTipChange, net_processing.cpp:2045-2059 ->
 txdownloadman_impl.cpp:92-96), because cached failures like non-final,
 too-low-fee, or missing-inputs can become valid at the next block.
-Previously only the reorg path cleared it."
+Previously only the reorg path cleared it. Out of initial block download, the
+only place Core resets it: ActiveTipChange is skipped while is_ibd."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (make-activate-block-fixture "wave8-rejects-clear")
-     (let ((rejects (bl:make-rejects-filter 100))
+     (let ((bl.net:*cached-is-ibd* nil)
+           (rejects (bl.net:txdownload-recent-rejects (bl.net:reset-txdownloadman)))
            (cached (make-array 32 :element-type '(unsigned-byte 8)
                                   :initial-element 77)))
        (bl:add-recent-reject rejects cached)
@@ -1735,14 +1737,14 @@ Previously only the reorg path cleared it."
        ;; Plain tip extension: genesis -> B1 (no reorg involved).
        (let* ((b1-hash (first (make-test-chain-hashes #xE8 1)))
               (b1 (make-reorg-test-block genesis-hash b1-hash 1)))
-         (bl.val:connect-block
-          b1 chain-state block-store utxo-set :recent-rejects rejects)
+         (bl.val:connect-block b1 chain-state block-store utxo-set)
          (is (= 1 (bl.store:current-height chain-state)))
          (is (equalp b1-hash (bl.store:best-block-hash chain-state))))
        (is-false (bl:recent-reject-p rejects cached))
        ;; And the filter still works after the reset.
        (bl:add-recent-reject rejects cached)
        (is-true (bl:recent-reject-p rejects cached)))
+     (bl.net:reset-txdownloadman)
      (clear-undo-cache))))
 
 ;;;; Wave 9C: removeForReorg — re-filter PRE-EXISTING entries after a reorg

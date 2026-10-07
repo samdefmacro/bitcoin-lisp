@@ -9,6 +9,7 @@ for it. Validation and the mempool name nothing above themselves.")
            #:notify-block-connected
            #:notify-block-disconnected
            #:notify-updated-block-tip
+           #:notify-active-tip-change
            #:notify-transaction-added
            #:notify-transaction-removed))
 
@@ -41,6 +42,7 @@ for it. Validation and the mempool name nothing above themselves.")
   '(:block-connected        ; (chainstate block block-hash height spent-utxos)
     :block-disconnected     ; (chainstate block block-hash height)
     :updated-block-tip      ; (chainstate block-hash height)
+    :active-tip-change      ; (chainstate)
     :transaction-added      ; (tx txid sequence)
     :transaction-removed)   ; (tx txid sequence reason)
   :test #'equalp :documentation "The events and the argument list each hook receives.")
@@ -80,6 +82,13 @@ SPENT-UTXOS is the undo list the connect produced -- what the indexes fold in."
   "CHAINSTATE's tip is now BLOCK-HASH at HEIGHT, after a completed activation
 step (Core UpdatedBlockTip / the kernel's blockTip notification)."
   (%announce :updated-block-tip chainstate block-hash height))
+
+(defun notify-active-tip-change (chainstate)
+  "CHAINSTATE, the active one, has a new tip -- after every activation step,
+even one that ends where it began, and after a reorg (Core ActiveTipChange,
+validation.cpp:3472-3475, :3722-3726). Subscribers ask for themselves whether
+the node is still in initial block download, as Core passes is_ibd."
+  (%announce :active-tip-change chainstate))
 
 (defun notify-transaction-added (tx txid sequence)
   "TX entered the mempool, stamped with SEQUENCE (Core TransactionAddedToMempool)."

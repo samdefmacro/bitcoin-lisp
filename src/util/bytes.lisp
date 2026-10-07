@@ -391,6 +391,14 @@ must be read as bytes (:var-bytes), not as a string."
          (loop for i of-type fixnum below n
                always (= (aref a i) (aref b i))))))
 
+(defun octets< (a b)
+  "T when octet vector A sorts before B byte by byte, a proper prefix first --
+Core's uint256 order (base_blob::Compare is a memcmp of the stored bytes), so
+a set of txids or wtxids walks in the order Core's std::set does."
+  (let ((i (mismatch a b)))
+    (and i (or (= i (length a))
+               (and (< i (length b)) (< (aref a i) (aref b i)))))))
+
 ;;;; Salted SipHash for hash-table keys (Core crypto/siphash.cpp, util/hasher.h)
 ;;;
 ;;; Core keys every txid and outpoint map with a SALTED SipHash --

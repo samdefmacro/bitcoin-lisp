@@ -4,27 +4,14 @@
 ;;;; TxRequestTracker against a naive reimplementation -- one announcement
 ;;;; slot per (txhash, peer) for sixteen txhashes and sixteen peers, each
 ;;;; NOTHING, CANDIDATE, REQUESTED or COMPLETED -- driven by a byte stream of
-;;;; commands, with every request the tracker makes checked against the model
-;;;; and a full comparison of counts, candidate peers and states at the end.
+;;;; commands, with every GetRequestable checked against the model (its
+;;;; requests in announcement order and its expiries) and a full comparison of
+;;;; counts, candidate peers and states at the end, then SanityCheck.
 ;;;;
-;;;; Our tracker (src/networking/protocol.lisp, `Tx-request tracking') is
-;;;; Core's in a different shape, and the target is adapted to it, not to
-;;;; Core's API:
-;;;;   - an announcement's delay is the peer's (preferred outbound peers
-;;;;     none, inbound peers NONPREF_PEER_TX_DELAY), not an argument, so peers
-;;;;     0-7 are outbound and 8-15 inbound, and Core's delayed-inv commands
-;;;;     (7, 8) announce like the immediate ones;
-;;;;   - there is no GetRequestable(peer) + RequestedTx(peer): the scheduler
-;;;;     pass (RETRY-TIMED-OUT-TX-REQUESTS, then PROCESS-TX-REQUESTS) grants
-;;;;     every hash to its best candidate at once with the sixty-second
-;;;;     GETDATA_TX_INTERVAL expiry, which is what GetRequestable for every
-;;;;     peer followed by RequestedTx for each result does; commands 2 and 9
-;;;;     both run it;
-;;;;   - TX-REQUEST-WANTED-P requests a ready announcement AT ONCE, which
-;;;;     Core does in the SendMessages that follows the inv: the model checks
-;;;;     such a request is one GetRequestable would have made then.
-;;;; The clock is the mockable one the tracker reads, in seconds; Core's delay
-;;;; table (microseconds) is read in seconds, rounded.
+;;;; The tracker is src/networking/txrequest.lisp, an object with Core's API,
+;;;; so this is Core's Tester line for line: peers are the integers 0-15
+;;;; (Core's NodeId), times are integers in Core's microseconds, and the
+;;;; priority salt is Core's deterministic one, k0 = k1 = 0.
 
 (def-suite :fuzz-txrequest-tests :in :bitcoin-lisp-tests
   :description "Core fuzz/txrequest.cpp target")
@@ -54,8 +41,8 @@
                      (aref delays i) prev)))
     (loop for i from 128 below 256
           do (setf (aref delays i) (- (aref delays (- 255 i)))))
-    (map 'simple-vector (lambda (us) (round us 1000000)) delays))
-  "Core's DELAYS table read in seconds, the unit of the tracker's clock.")
+    delays)
+  "Core's DELAYS table (txrequest.cpp:30-50), in microseconds.")
 
 (defun txrequest-priority (hash peer-id preferred k0 k1)
   "Core PriorityComputer (txrequest.cpp:112-118): SipHash(k0, k1, txhash ||
@@ -73,25 +60,21 @@ peer) shifted right one bit, the preferred bit on top."
 
 (define-fuzz-target txrequest
     (buffer :core "txrequest.cpp:325-389" :iterations 1000 :max-len 400)
-  "Every request the tracker makes is the one Core's GetRequestable picks --
-the ready candidate with the highest salted priority, only while nothing is
-in flight -- and goes out under that announcement's own id type; an expired
-request completes and fails over; a response, a forgotten hash and a
-disconnect release exactly what Core's do; and at the end every
-(txhash, peer) state, every count and every candidate-peer set is the
-model's."
-  (let* ((k0 #x0123456789abcdef) (k1 #xfedcba9876543210)
+  "Every GetRequestable answer is the model's -- for each txhash the ready
+candidate of highest salted priority while nothing is in flight, in
+announcement order, under its own id type -- and so is every expiry it
+reports; a response, a forgotten hash, a disconnect and a RequestedTx move
+exactly what Core's do; and at the end every count, every candidate-peer set
+and SanityCheck agree with the model."
+  (let* ((tr (bl.net:make-tx-request-tracker))
          (anns (make-array '(16 16)))
          (events '())
          (sequence 0)
-         (now 1600000000)
-         (peers (coerce (loop for p below 16
-                              collect (bl.net:make-peer :state :ready :inbound (>= p 8)))
-                        'simple-vector))
+         (now 244466666)
          (it 0))
     (dotimes (h 16) (dotimes (p 16) (setf (aref anns h p) (make-txrequest-ann))))
     (labels ((next-byte () (if (< it (length buffer)) (prog1 (aref buffer it) (incf it)) 0))
-             (preferred-p (p) (< p 8))
+             (hash (h) (aref *txrequest-hashes* h))
              (cleanup (h)
                ;; Delete a txhash whose only announcements are COMPLETED.
                (let ((all-nothing t))
@@ -112,156 +95,145 @@ model's."
                                 (<= (txrequest-ann-time a) now)
                                 (or (null ret) (> (txrequest-ann-priority a) best)))
                        (setf ret p best (txrequest-ann-priority a)))))))
-             (request (h p)
-               ;; RequestedTx with the tracker's GETDATA_TX_INTERVAL expiry.
-               (dotimes (p2 16)
-                 (when (eq (txrequest-ann-state (aref anns h p2)) :requested)
-                   (setf (txrequest-ann-state (aref anns h p2)) :completed)))
-               (setf (txrequest-ann-state (aref anns h p)) :requested
-                     (txrequest-ann-time (aref anns h p)) (+ now 60))
-               (push (+ now 60) events))
-             (set-now (time)
-               (setf now time bl.ser:*mock-time* time)
+             (drop-past-events ()
                (setf events (remove-if (lambda (e) (<= e now)) events)))
-             (check-in-flight (h)
-               ;; The tracker's outstanding request for H is the model's, and
-               ;; goes out as that announcement's id type.
-               (let ((real (tx-request-in-flight-peer (aref *txrequest-hashes* h)))
-                     (model (loop for p below 16
-                                  when (eq (txrequest-ann-state (aref anns h p)) :requested)
-                                    return p)))
-                 (fuzz-assert (eq real (and model (aref peers model)))
-                              "hash ~D: in flight to ~A, the model says peer ~A" h
-                              (and real (position real peers)) model)
-                 (when (and model (eq real (aref peers model)))
-                   (fuzz-assert (eq (and (tx-request-wtxid-entry-p
-                                          (aref *txrequest-hashes* h))
-                                         t)
-                                    (txrequest-ann-wtxid (aref anns h model)))
-                                "hash ~D requested from peer ~D as a ~:[txid~;wtxid~], announced as a ~:[txid~;wtxid~]"
-                                h model (tx-request-wtxid-entry-p (aref *txrequest-hashes* h))
-                                (txrequest-ann-wtxid (aref anns h model))))))
-             (scheduler-pass ()
-               ;; GetRequestable for every peer: expire, then grant each hash
-               ;; to its best ready candidate.
+             (advance-time (offset)
+               (incf now offset)
+               (drop-past-events))
+             (advance-to-event ()
+               (drop-past-events)
+               (when events
+                 (let ((next (reduce #'min events)))
+                   (setf now next
+                         events (remove next events :count 1)))))
+             (disconnected-peer (p)
                (dotimes (h 16)
-                 (dotimes (p 16)
+                 (unless (eq (txrequest-ann-state (aref anns h p)) :nothing)
+                   (setf (txrequest-ann-state (aref anns h p)) :nothing)
+                   (cleanup h)))
+               (bl.net:txrequest-disconnected-peer tr p))
+             (forget-tx-hash (h)
+               (dotimes (p 16) (setf (txrequest-ann-state (aref anns h p)) :nothing))
+               (cleanup h)
+               (bl.net:txrequest-forget-tx-hash tr (hash h)))
+             (received-inv (p h wtxidp preferred reqtime)
+               (let ((a (aref anns h p)))
+                 (when (eq (txrequest-ann-state a) :nothing)
+                   (setf (txrequest-ann-state a) :candidate
+                         (txrequest-ann-time a) reqtime
+                         (txrequest-ann-wtxid a) wtxidp
+                         (txrequest-ann-sequence a) (prog1 sequence (incf sequence))
+                         (txrequest-ann-priority a) (txrequest-priority (hash h) p preferred 0 0))
+                   (when (> reqtime now) (push reqtime events))))
+               (bl.net:txrequest-received-inv tr p (hash h) wtxidp preferred reqtime))
+             (requested-tx (p h exptime)
+               (when (eq (txrequest-ann-state (aref anns h p)) :candidate)
+                 (dotimes (p2 16)
+                   (when (eq (txrequest-ann-state (aref anns h p2)) :requested)
+                     (setf (txrequest-ann-state (aref anns h p2)) :completed)))
+                 (setf (txrequest-ann-state (aref anns h p)) :requested
+                       (txrequest-ann-time (aref anns h p)) exptime))
+               (when (> exptime now) (push exptime events))
+               (bl.net:txrequest-requested-tx tr p (hash h) exptime))
+             (received-response (p h)
+               (unless (eq (txrequest-ann-state (aref anns h p)) :nothing)
+                 (setf (txrequest-ann-state (aref anns h p)) :completed)
+                 (cleanup h))
+               (bl.net:txrequest-received-response tr p (hash h)))
+             (get-requestable (p)
+               (let ((result '()) (expected-expired '()))
+                 (dotimes (h 16)
+                   ;; Mark any expired REQUESTED announcement COMPLETED.
+                   (dotimes (p2 16)
+                     (let ((a2 (aref anns h p2)))
+                       (when (and (eq (txrequest-ann-state a2) :requested)
+                                  (<= (txrequest-ann-time a2) now))
+                         (push (list p2 h (txrequest-ann-wtxid a2)) expected-expired)
+                         (setf (txrequest-ann-state a2) :completed)
+                         (return))))
+                   (cleanup h)
                    (let ((a (aref anns h p)))
-                     (when (and (eq (txrequest-ann-state a) :requested) (<= (txrequest-ann-time a) now))
-                       (setf (txrequest-ann-state a) :completed)
-                       (return))))
-                 (cleanup h)
-                 (let ((best (selected h)))
-                   (when best (request h best))))
-               (bl.net:retry-timed-out-tx-requests)
-               (bl.net:process-tx-requests)
-               (dotimes (h 16) (check-in-flight h))))
-      (bl.net:reset-tx-requests)
-      (let ((bl.ser:*mock-time* now))
-        (with-tx-request-salt (k0 k1)
-          (loop while (< it (length buffer))
-                do (let ((cmd (mod (next-byte) 11)))
-                     (case cmd
-                       (0 (let ((next (reduce #'min events :initial-value most-positive-fixnum)))
-                            (when (< next most-positive-fixnum) (set-now next))))
-                       (1 (set-now (+ now (aref *txrequest-delays* (next-byte)))))
-                       ((2 9) (when (= cmd 9) (next-byte) (next-byte) (next-byte))
-                        (scheduler-pass))
-                       (3 (let ((p (mod (next-byte) 16)))
-                            (dotimes (h 16)
-                              (unless (eq (txrequest-ann-state (aref anns h p)) :nothing)
-                                (setf (txrequest-ann-state (aref anns h p)) :nothing)
-                                (cleanup h)))
-                            (bl.net:tx-request-disconnected-peer (aref peers p))))
-                       (4 (let ((h (mod (next-byte) 16)))
-                            (dotimes (p 16) (setf (txrequest-ann-state (aref anns h p)) :nothing))
-                            (bl.net:tx-request-received (aref *txrequest-hashes* h))))
-                       ((5 6 7 8)
-                        (let* ((p (mod (next-byte) 16))
-                               (txidnum (next-byte))
-                               (h (mod txidnum 16))
-                               (wtxid (logbitp 0 (floor txidnum 16)))
-                               (a (aref anns h p)))
-                          (when (>= cmd 7) (next-byte))
-                          (when (eq (txrequest-ann-state a) :nothing)
-                            (setf (txrequest-ann-state a) :candidate
-                                  (txrequest-ann-time a) (if (preferred-p p) now (+ now 2))
-                                  (txrequest-ann-wtxid a) wtxid
-                                  (txrequest-ann-sequence a) (incf sequence)
-                                  (txrequest-ann-priority a)
-                                  (txrequest-priority (aref *txrequest-hashes* h)
-                                                      (bl.net:peer-id (aref peers p))
-                                                      (preferred-p p) k0 k1))
-                            (when (> (txrequest-ann-time a) now)
-                              (push (txrequest-ann-time a) events)))
-                          (let ((requested (bl.net:tx-request-wanted-p
-                                            (aref *txrequest-hashes* h) (aref peers p) wtxid 0)))
-                            (when requested
-                              ;; Core requests in the SendMessages after the inv,
-                              ;; and only the best ready candidate.
-                              (fuzz-assert (eql (selected h) p)
-                                           "peer ~D was sent a request for hash ~D the model grants to ~A"
-                                           p h (selected h))
-                              (when (eql (selected h) p) (request h p)))
-                            (check-in-flight h))))
-                       (10 (let ((p (mod (next-byte) 16))
-                                 (h (mod (next-byte) 16)))
-                             (unless (eq (txrequest-ann-state (aref anns h p)) :nothing)
-                               (setf (txrequest-ann-state (aref anns h p)) :completed)
-                               (cleanup h))
-                             (bl.net:tx-request-received-response (aref peers p) (aref *txrequest-hashes* h))
-                             (check-in-flight h))))))
-          ;; Check (:297-322).
-          (let ((total 0))
-            (dotimes (p 16)
-              (let ((tracked 0) (inflight 0) (candidates 0))
-                (dotimes (h 16)
-                  (let ((st (txrequest-ann-state (aref anns h p)))
-                        (hash (aref *txrequest-hashes* h)))
-                    (unless (eq st :nothing) (incf tracked))
-                    (when (eq st :requested) (incf inflight))
-                    (when (eq st :candidate) (incf candidates))
-                    ;; This (txhash, peer) slot is the model's.
-                    (let ((real-state
-                            (cond ((eq (tx-request-in-flight-peer hash) (aref peers p)) :requested)
-                                  ((member (aref peers p) (tx-request-announcement-peers hash))
-                                   :candidate)
-                                  ((tx-request-completed-p hash (aref peers p)) :completed)
-                                  (t :nothing))))
-                      (fuzz-assert (eq (fuzz-sabotage-state real-state) st)
-                                   "hash ~D peer ~D: tracker ~A, model ~A" h p real-state st))))
-                (fuzz-assert (= (bl.net:tx-request-count (aref peers p)) tracked)
-                             "peer ~D: Count ~D, model ~D" p (bl.net:tx-request-count (aref peers p)) tracked)
-                (fuzz-assert (= (tx-request-peer-in-flight-count (aref peers p)) inflight)
-                             "peer ~D: CountInFlight ~D, model ~D" p
-                             (tx-request-peer-in-flight-count (aref peers p)) inflight)
-                (incf total tracked)))
-            (fuzz-assert (= total (loop for h below 16
-                                        sum (length (tx-request-announcement-peers
-                                                     (aref *txrequest-hashes* h) :completed t))))
-                         "Size differs from the model")
-            (dotimes (h 16)
-              (let ((expect (loop for p below 16
-                                  when (member (txrequest-ann-state (aref anns h p)) '(:candidate :requested))
-                                    collect (aref peers p)))
-                    (got (bl.net:tx-request-candidate-peers (aref *txrequest-hashes* h))))
-                (fuzz-assert (and (= (length expect) (length got))
-                                  (every (lambda (x) (member x expect)) got))
-                             "hash ~D: candidate peers differ" h)))))))))
-
-(defun fuzz-sabotage-state (state)
-  "STATE, or -- in the positive-control run -- the next state of the four."
-  (if (eq *fuzz-sabotage* :assert)
-      (case state (:nothing :candidate) (:candidate :requested) (:requested :completed) (t :nothing))
-      state))
+                     (when (and (eq (txrequest-ann-state a) :candidate)
+                                (eql (selected h) p))
+                       (push (list (txrequest-ann-sequence a) h (txrequest-ann-wtxid a)) result))))
+                 (setf result (sort result #'< :key #'first))
+                 (multiple-value-bind (actual expired)
+                     (bl.net:txrequest-get-requestable tr p now)
+                   (let ((got (sort (mapcar (lambda (e)
+                                              (list (first e) (position (second e) *txrequest-hashes*
+                                                                        :test #'equalp)
+                                                    (and (cddr e) t)))
+                                            expired)
+                                    #'< :key (lambda (e) (+ (* 100 (first e)) (second e)))))
+                         (want (sort expected-expired #'< :key (lambda (e) (+ (* 100 (first e)) (second e))))))
+                     (fuzz-assert (equal got (fuzz-sabotage want))
+                                  "GetRequestable(~D) expired ~S, the model ~S" p got want))
+                   (fuzz-assert (= (length result) (length actual))
+                                "GetRequestable(~D) returned ~D, the model ~D" p (length actual) (length result))
+                   (loop for (nil h wtxidp) in result
+                         for (hash . actual-wtxidp) in actual
+                         do (fuzz-assert (and (equalp (hash h) hash) (eq wtxidp actual-wtxidp))
+                                         "GetRequestable(~D) out of order or of the wrong id type" p))))))
+      (with-tx-request-salt (0 0)
+        (loop while (< it (length buffer))
+              do (let ((cmd (mod (next-byte) 11)))
+                   (case cmd
+                     (0 (advance-to-event))
+                     (1 (advance-time (aref *txrequest-delays* (next-byte))))
+                     (2 (get-requestable (mod (next-byte) 16)))
+                     (3 (disconnected-peer (mod (next-byte) 16)))
+                     (4 (forget-tx-hash (mod (next-byte) 16)))
+                     ((5 6)
+                      (let ((p (mod (next-byte) 16)) (txidnum (next-byte)))
+                        (received-inv p (mod txidnum 16) (logbitp 0 (floor txidnum 16)) (logbitp 0 cmd)
+                                      most-negative-fixnum)))
+                     ((7 8)
+                      (let ((p (mod (next-byte) 16)) (txidnum (next-byte)) (delaynum (next-byte)))
+                        (received-inv p (mod txidnum 16) (logbitp 0 (floor txidnum 16)) (logbitp 0 cmd)
+                                      (+ now (aref *txrequest-delays* delaynum)))))
+                     (9 (let ((p (mod (next-byte) 16)) (txidnum (next-byte)) (delaynum (next-byte)))
+                          (requested-tx p (mod txidnum 16) (+ now (aref *txrequest-delays* delaynum)))))
+                     (10 (let ((p (mod (next-byte) 16)) (txidnum (next-byte)))
+                           (received-response p (mod txidnum 16)))))))
+        ;; Check (:291-322).
+        (let ((total 0))
+          (dotimes (p 16)
+            (let ((tracked 0) (inflight 0) (candidates 0))
+              (dotimes (h 16)
+                (let ((st (txrequest-ann-state (aref anns h p))))
+                  (unless (eq st :nothing) (incf tracked))
+                  (when (eq st :requested) (incf inflight))
+                  (when (eq st :candidate) (incf candidates))))
+              (fuzz-assert (= (bl.net:txrequest-count tr p) tracked)
+                           "peer ~D: Count ~D, model ~D" p (bl.net:txrequest-count tr p) tracked)
+              (fuzz-assert (= (bl.net:txrequest-count-in-flight tr p) inflight)
+                           "peer ~D: CountInFlight ~D, model ~D" p
+                           (bl.net:txrequest-count-in-flight tr p) inflight)
+              (fuzz-assert (= (fuzz-sabotage (bl.net:txrequest-count-candidates tr p)) candidates)
+                           "peer ~D: CountCandidates ~D, model ~D" p
+                           (bl.net:txrequest-count-candidates tr p) candidates)
+              (incf total tracked)))
+          (dotimes (h 16)
+            (let ((expect (loop for p below 16
+                                when (member (txrequest-ann-state (aref anns h p)) '(:candidate :requested))
+                                  collect p))
+                  (got (bl.net:txrequest-get-candidate-peers tr (hash h))))
+              (fuzz-assert (and (= (length expect) (length got))
+                                (every (lambda (x) (member x expect)) got))
+                           "hash ~D: candidate peers differ" h)))
+          (fuzz-assert (= (bl.net:txrequest-size tr) total)
+                       "Size ~D, the model ~D" (bl.net:txrequest-size tr) total)
+          (let ((problems (bl.net:txrequest-sanity-check tr)))
+            (fuzz-assert (null problems) "SanityCheck: ~{~A~^; ~}" problems)))))))
 
 (test txrequest-pinned-buffers
-  "The buffers the txrequest port found failing, replayed. The first draw
-asked a wtxid announcer for its hash by txid, the tracker keeping one id type
-per hash (fixed in `Net: a tx request goes out under the id type of the
-announcement it is granted to'); the 27th then asked a newcomer ahead of a
-ready candidate of higher priority (fixed in `Net: an announcement is asked
-for at once only when it is the best candidate')."
+  "The buffers the first txrequest port found failing, replayed through
+Core's tester as it stands. The first draw asked a wtxid announcer for its
+hash by txid, the tracker keeping one id type per hash (fixed in `Net: a tx
+request goes out under the id type of the announcement it is granted to'); the
+27th then asked a newcomer ahead of a ready candidate of higher priority (fixed
+in `Net: an announcement is asked for at once only when it is the best
+candidate')."
   (is (null (replay-fuzz-target
              'txrequest
              "fd073175d97ca7f852bf60d1a10b3d7cd7aec20c0cf4f7055fc647ec7d04edf3759fe26fea30e324a447ba79f1648941f9a07e464af0c33d3676448eec95e80ea3de873c564db6c3d9e2d9b2d56763bdb72623afb7cc6a87aa1ca537b7a054805901afbf9c6eb76c164b3a3cf0d7f0fda581e6837378bd6129a3b0966cac2d9b5bc8d4a1734e9250ddf8c641")))

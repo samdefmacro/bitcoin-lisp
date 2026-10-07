@@ -422,29 +422,121 @@ node uses while it is still syncing, which handles block and headers itself
 and hands everything else to the generic handler."
   (bl.net::dispatch-ibd-message peer command payload node-ctx ibd-ctx))
 
-;;;; The tx-request tracker (Core TxRequestTracker)
+;;;; The tx-download manager (Core TxDownloadManager) and its tracker
 ;;;
-;;; White-box readers for a structure with no public accessors: the state a
-;;; tx-relay test asserts on is the tracker's, and every one of these
-;;; questions was being asked from several test files at once.
+;;; White-box readers for the node's manager (BL.NET:NODE-TXDOWNLOADMAN): the
+;;; state a tx-relay test asserts on is the tracker's, the orphanage's and
+;;; the filters', and every one of these questions was being asked from
+;;; several test files at once.
+
+(defun test-txdownloadman ()
+  "The node's TxDownloadManager, the one the handlers drive."
+  (bl.net:node-txdownloadman))
+
+(defun test-txrequest ()
+  "The node manager's TxRequestTracker."
+  (bl.net:txdownload-txrequest (test-txdownloadman)))
+
+(defun test-orphanage ()
+  "The node manager's orphanage."
+  (bl.net:txdownload-orphanage (test-txdownloadman)))
+
+(defun reconsiderable-reject-p (hash)
+  "T when HASH is in the node manager's reconsiderable rejects filter."
+  (and (bl:recent-reject-p
+        (bl.net:txdownload-recent-rejects-reconsiderable (test-txdownloadman)) hash)
+       t))
+
+(defun add-reconsiderable-reject (hash)
+  "Put HASH in the node manager's reconsiderable rejects filter."
+  (bl:add-recent-reject
+   (bl.net:txdownload-recent-rejects-reconsiderable (test-txdownloadman)) hash))
+
+(defun recently-confirmed-p (hash)
+  "T when HASH is in the node manager's recently-confirmed filter."
+  (and (bl:recent-reject-p (bl.net:txdownload-recent-confirmed (test-txdownloadman)) hash)
+       t))
+
+(defun clear-recent-confirmed ()
+  "Empty the node manager's recently-confirmed filter (Core BlockDisconnected's
+reset)."
+  (bl:clear-recent-rejects (bl.net:txdownload-recent-confirmed (test-txdownloadman))))
+
+(defun drain-orphan-work (peers ctx)
+  "Run Core's ProcessOrphanTx for each of PEERS until no work set holds
+anything -- the orphan turns the message pump would take, without the
+messages. Returns the number of orphans resolved."
+  (loop with resolved = 0
+        while (some (lambda (peer)
+                      (when (bl.net:process-orphan-tx peer ctx)
+                        (incf resolved)))
+                    peers)
+        finally (return resolved)))
+
+(defun announce-tx (hash peer &optional wtxidp)
+  "PEER announces HASH (a wtxid when WTXIDP) to the node's manager, and the
+SendMessages pass that follows asks it for HASH if HASH is now its to ask for
+-- the old one-call shape of an inv followed by its getdata, without asking
+PEER for anything ELSE it has due. Returns T when HASH was requested from PEER
+now."
+  (let* ((mgr (test-txdownloadman))
+         (tr (bl.net:txdownload-txrequest mgr))
+         (now (bl.ser:get-unix-time)))
+    (bl.net:txdownload-add-tx-announcement mgr peer hash wtxidp now)
+    (when (find hash (bl.net:txrequest-get-requestable tr peer now)
+                :key #'car :test #'equalp)
+      (bl.net:txrequest-requested-tx tr peer hash
+                                     (+ now bl.net:+getdata-tx-interval-seconds+))
+      t)))
+
+(defun run-tx-requests (&optional ctx)
+  "One SendMessages pass over every peer the tracker knows: expire what is due,
+and send each :READY peer the getdata GetRequestsToSend hands it. The manager
+is CTX's (BL.NET:CTX-TXDOWNLOADMAN), else the node's. Returns the number of
+transactions requested."
+  (let ((mgr (if ctx (bl.net:ctx-txdownloadman ctx) (test-txdownloadman))))
+    (bl.net:send-tx-requests-to-peers
+     (loop for peer being the hash-keys
+             of (bl.net::txrequest-by-peer (bl.net:txdownload-txrequest mgr))
+           collect peer)
+     mgr)))
+
+(defun forget-tx-hash (hash)
+  "Forget HASH in the node manager's tracker (Core ForgetTxHash)."
+  (bl.net:txrequest-forget-tx-hash (test-txrequest) hash))
+
+(defun tx-request-received-response (peer hash)
+  "PEER answered for HASH (Core ReceivedResponse)."
+  (bl.net:txrequest-received-response (test-txrequest) peer hash))
+
+(defun tx-request-candidate-peers (hash)
+  "Core GetCandidatePeers on the node manager's tracker."
+  (bl.net:txrequest-get-candidate-peers (test-txrequest) hash))
+
+(defun tx-request-count (peer)
+  "Core Count(peer) on the node manager's tracker."
+  (bl.net:txrequest-count (test-txrequest) peer))
+
+(defun %txrequest-announcements (hash)
+  (gethash hash (bl.net::txrequest-announcers (test-txrequest))))
 
 (defun tx-request-in-flight-peer (hash)
   "The peer holding the outstanding getdata for HASH (Core's REQUESTED
 announcement), or NIL when nothing is in flight for it."
-  (car (gethash hash bl.net::*tx-in-flight*)))
+  (car (gethash hash (bl.net::txrequest-in-flight (test-txrequest)))))
 
 (defun tx-request-announcement-peers (hash &key completed)
   "The peers with an announcement of HASH, newest first. By default only the
 LIVE ones (Core's non-COMPLETED states, what GetCandidatePeers returns); with
 COMPLETED true, every announcement the tracker still holds for the hash."
-  (loop for ann in (gethash hash bl.net::*tx-announcers*)
+  (loop for ann in (%txrequest-announcements hash)
         when (or completed (not (bl.net::tx-ann-completed ann)))
           collect (bl.net::tx-ann-peer ann)))
 
 (defun tx-request-completed-p (hash peer)
   "T when PEER's announcement of HASH exists and is COMPLETED -- Core's
 State::COMPLETED, the slot a failed peer keeps."
-  (let ((ann (find peer (gethash hash bl.net::*tx-announcers*)
+  (let ((ann (find peer (%txrequest-announcements hash)
                    :key #'bl.net::tx-ann-peer :test #'eq)))
     (and ann (bl.net::tx-ann-completed ann) t)))
 
@@ -454,48 +546,63 @@ a txid: the id type of the announcement the request was granted to, which is
 what decides the inv type of its getdata."
   (let ((peer (tx-request-in-flight-peer hash)))
     (and peer
-         (let ((ann (find peer (gethash hash bl.net::*tx-announcers*)
+         (let ((ann (find peer (%txrequest-announcements hash)
                           :key #'bl.net::tx-ann-peer :test #'eq)))
            (and ann (bl.net::tx-ann-wtxid ann))))))
 
 (defun backdate-tx-announcements (hash &optional (seconds 1))
   "Make every announcement of HASH due, as if its NONPREF/TXID/OVERLOADED
-delay had elapsed SECONDS ago, so the next scheduler pass may grant it. Every
+delay had elapsed SECONDS ago, so the next pass may grant it. Every
 announcement gets the SAME ready time, which is what lets a test ask which
 one the tracker picks without announcement time deciding it. Returns the
 number of announcements moved."
-  ;; The tracker's clock is %TX-REQUEST-NOW, Core's mockable NodeClock in
-  ;; seconds, not the process-relative internal-real-time.
   (let ((ready (- (bl.ser:get-unix-time) (max 1 seconds)))
         (n 0))
-    (dolist (ann (gethash hash bl.net::*tx-announcers*) n)
+    (dolist (ann (%txrequest-announcements hash) n)
       (incf n)
       (setf (bl.net::tx-ann-ready ann) ready))))
 
 (defun expire-tx-request (hash &optional (seconds 120))
-  "Backdate HASH's in-flight request SECONDS into the past, so the next
-RETRY-TIMED-OUT-TX-REQUESTS sees it past GETDATA_TX_INTERVAL. Returns the
+  "Make HASH's in-flight request one that was sent SECONDS ago, so the next
+pass sees it past GETDATA_TX_INTERVAL when SECONDS exceeds that. Returns the
 peer whose request was backdated, or NIL if nothing was in flight."
-  (let ((entry (gethash hash bl.net::*tx-in-flight*)))
+  (let* ((tr (test-txrequest))
+         (entry (gethash hash (bl.net::txrequest-in-flight tr))))
     (when entry
-      (setf (cdr entry) (- (bl.ser:get-unix-time) seconds))
+      (setf (cdr entry) (- (+ (bl.ser:get-unix-time) bl.net:+getdata-tx-interval-seconds+)
+                           seconds)
+            ;; An expiry the tracker has not seen: make it look again.
+            (bl.net::txrequest-next-expiry tr) 0)
       (car entry))))
 
 (defun (setf tx-request-peer-count) (n peer)
-  "Put PEER's tracked-announcement count at N (Core m_peerinfo[peer].m_total)
-so a cap test does not need N real announcements."
-  (setf (gethash peer bl.net::*tx-peer-announcements*) n))
+  "Make PEER's tracked-announcement count (Core Count) N by filling its
+by-peer entry with N placeholder hashes, so a cap test does not need N real
+announcements. The placeholders are not in any txhash's announcer list: a
+SanityCheck would flag them, which is the price of the shortcut."
+  (let ((anns (bl.bytes:make-octets-hash-table)))
+    (dotimes (i n)
+      (setf (gethash (let ((h (make-array 33 :element-type '(unsigned-byte 8)
+                                              :initial-element 0)))
+                       (setf (aref h 0) (ldb (byte 8 0) i)
+                             (aref h 1) (ldb (byte 8 8) i))
+                       h)
+                     anns)
+            (bl.net::%make-tx-announcement peer 0 0 nil 0)))
+    (if (zerop n)
+        (remhash peer (bl.net::txrequest-by-peer (test-txrequest)))
+        (setf (gethash peer (bl.net::txrequest-by-peer (test-txrequest))) anns))
+    n))
 
 (defun tx-request-peer-in-flight-count (peer)
   "PEER's in-flight request count as the tracker keeps it (Core
-CountInFlight): the counter the overloaded-peer delay reads, which the txrequest
-fuzz target checks against the requests actually outstanding."
-  (gethash peer bl.net::*tx-peer-in-flight* 0))
+CountInFlight): the counter the overloaded-peer delay reads."
+  (bl.net:txrequest-count-in-flight (test-txrequest) peer))
 
 (defun (setf tx-request-peer-in-flight-count) (n peer)
   "Put PEER's in-flight request count at N (Core CountInFlight), the input to
 the OVERLOADED_PEER_TX_DELAY."
-  (setf (gethash peer bl.net::*tx-peer-in-flight*) n))
+  (setf (gethash peer (bl.net::txrequest-peer-in-flight (test-txrequest))) n))
 
 (defun drain-peer-once (peer node-ctx &optional ibd-ctx)
   "Run the shipped per-peer message pump over PEER exactly once (Core's

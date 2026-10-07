@@ -1615,15 +1615,16 @@ than a hand-built one."
 
 (defun %init-services (network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level require-full-verification)
   "The RPC server, up early (Core Step 4a AppInitServers, answering
-RPC_IN_WARMUP while the rest loads); the recent-rejects filter, the fee
-estimator, the address book and banlist (Step 6); the anchors (Step 12); the coins-DB tip reconciliation and the VerifyDB pass over
+RPC_IN_WARMUP while the rest loads); the mempool and the TxDownloadManager
+that reads it, the fee estimator, the address book and banlist (Step 6); the anchors (Step 12); the coins-DB tip reconciliation and the VerifyDB pass over
 it; the indexes (Step 8) and -forcecompactdb."
-  ;; Initialize recent rejects filter (DoS protection)
-  (setf (node-recent-rejects *node*) (make-rejects-filter))
-
   ;; Initialize mempool
   (log-info "Initializing mempool...")
   (setf (node-mempool *node*) (bl.mp:make-mempool))
+  ;; Core builds PeerManager -- and with it the TxDownloadManager, its
+  ;; orphanage, tx-request tracker and rejection filters -- once the mempool
+  ;; it reads exists (init.cpp, PeerManager::make).
+  (bl.net:reset-txdownloadman (node-mempool *node*))
 
   (%init-fee-estimation (node-data-directory *node*))
 
@@ -1888,21 +1889,11 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
     ;; Ready peers' InactivityCheck + MaybeSendPing, after their messages as
     ;; Core's SendMessages follows ProcessMessages (net.cpp:2218, :3143-3148).
     (check-peers-health *node*)
-    ;; Tx-request scheduler: send
-    ;; delayed announcements now due,
-    ;; and re-route requests that
-    ;; expired (60s) to another
-    ;; announcer (Core GetRequestsToSend
-    ;; runs per SendMessages pass). The
-    ;; context is what lets it drop a
-    ;; request for a transaction that
-    ;; has arrived some other way since
-    ;; the announcement (Core's
-    ;; belt-and-suspenders AlreadyHaveTx
-    ;; re-check, txdownloadman_impl.cpp
-    ;; :274-284).
-    (bl.net:process-tx-requests ctx)
-    (bl.net:retry-timed-out-tx-requests ctx)
+    ;; Transaction getdatas: each peer's SendMessages asks
+    ;; m_txdownloadman.GetRequestsToSend for what is due -- announcements
+    ;; whose delay has passed, and the next candidate of a request that
+    ;; expired or was answered notfound (net_processing.cpp:6201-6217).
+    (bl.net:send-tx-requests-to-peers (node-peers *node*) (bl.net:node-txdownloadman))
     ;; Queued block announcements: ONE
     ;; message per peer for everything
     ;; connected since the last pass
@@ -2382,13 +2373,9 @@ per-process sync state and the at-tip liveness signal reset for this run."
   (when sync
     (bl.net:reset-ibd-stop)
     (bl.net:reset-ibd-context)          ; one IBD context per node
-    (bl.net:reset-tx-requests)
     (bl.net:reset-initial-broadcast-schedule)
     ;; Core's vExtraTxnForCompact belongs to the PeerManager, one per node.
     (bl.net:reset-compact-extra-transactions)
-    ;; Fresh recent-confirmed filter (Core builds it per process; covers
-    ;; in-image restarts).
-    (bl.val:reset-recent-confirmed)
     ;; Seed the durable at-tip liveness signal (item 6) so a freshly-started,
     ;; already-at-tip node reports healthy on /rest/health before its first new
     ;; block. last-tip-height starts at the current tip so only genuine advances
