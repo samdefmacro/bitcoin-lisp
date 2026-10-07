@@ -127,18 +127,11 @@ init.cpp, node/. src/node/.")
    #:token-bucket-rate
    #:token-bucket-burst
    #:token-bucket-tokens
-   ;; Recent rejects filter
-   #:recent-rejects
-   #:make-rejects-filter
-   #:recent-reject-p
-   #:add-recent-reject
-   #:clear-recent-rejects
    ;; DoS protection configuration
    #:*rpc-rate-limit*
    #:+max-message-payload+
    #:+max-rpc-body-size+
    #:*handshake-timeout-seconds*
-   #:*recent-rejects-max-size*
    ;; Node
    #:node
    #:*node*

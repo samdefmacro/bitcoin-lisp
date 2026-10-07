@@ -49,24 +49,22 @@ answers."
 
 (define-fuzz-target rolling-bloom-filter
     (buffer :core "rolling_bloom_filter.cpp:18-50" :iterations 1500 :max-len 600)
-  "Core's CRollingBloomFilter is ours as the recent-rejects ring (a bounded
-hash set with FIFO eviction), which every rolling filter of Core's maps onto
--- the known-address and known-inventory filters, the recent rejects, the
-recently confirmed. Whatever the capacity and whatever was inserted or reset
-before, an element is contained right after it is inserted."
+  "Core's CRollingBloomFilter (src/networking/bloom.lisp): whatever the
+capacity, the false-positive rate and what was inserted or reset before, an
+element is contained right after it is inserted."
   (let* ((fdp (make-fuzzed-data-provider buffer))
-         (filter (bl:make-rejects-filter (consume-integral-in-range fdp 1 1000 32))))
-    (consume-integral-in-range fdp 1 #xffffffff 32) ; Core's false-positive rate
+         (filter (bl.net:make-rolling-bloom-filter
+                  (consume-integral-in-range fdp 1 1000 32)
+                  (/ 0.999d0 (consume-integral-in-range fdp 1 #xffffffff 32)))))
     (flet ((insert-and-find (key)
-             (bl:recent-reject-p filter key)
-             (bl:add-recent-reject filter key)
-             (fuzz-assert (fuzz-sabotage (and (bl:recent-reject-p filter key) t))
+             (bl.net:rolling-bloom-insert filter key)
+             (fuzz-assert (fuzz-sabotage (bl.net:rolling-bloom-contains-p filter key))
                           "inserted ~A, not contained" (bl.crypto:bytes-to-hex key))))
       (limited-while ((plusp (remaining-bytes fdp)) 3000)
         (call-one-of fdp
           (insert-and-find (consume-random-length-byte-vector fdp))
           (insert-and-find (consume-uint256 fdp))
-          (bl:clear-recent-rejects filter))))))
+          (bl.net:rolling-bloom-reset filter))))))
 
 ;;; --- net_permissions.cpp -------------------------------------------------------
 

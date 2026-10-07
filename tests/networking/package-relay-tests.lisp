@@ -132,9 +132,9 @@ old confirmed one and the missing one; we asked for the missing one only."
         (clear-recent-confirmed)
         (deliver-tx peer (%pr-payload orphan) (%pr-ctx state utxo mempool))
         (is-true (%pr-orphan-p orphan))
-        (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) missing)
+        (is-true (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs peer) missing)
                  "the control: the missing parent is requested")
-        (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) funding)
+        (is-true (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs peer) funding)
                  "the confirmed parent is requested as well")))))
 
 ;;;; (a) The headline case: an LN-shaped CPFP pair arriving as two messages
@@ -643,7 +643,7 @@ announcer."
         ;; Witness that the delivery really reached the handler and really
         ;; was rejected for the malleation: the sender is marked as knowing
         ;; the txid, and the TWIN's wtxid -- not the txid -- is cached.
-        (is-true (bl:recent-reject-p (bl.net:peer-announced-txs attacker) txid))
+        (is-true (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs attacker) txid))
         (is-true (bl.net:rolling-bloom-contains-p rejects (bl.ser:transaction-wtxid twin)))
         (is-false (bl.net:rolling-bloom-contains-p rejects txid))
         (is-false (bl.mp:mempool-has mempool txid))
@@ -864,9 +864,9 @@ TXID on both sides -- an orphan's parents are known only by txid."
           (deliver-tx a (%pr-payload child) ctx)
           (is-true (%pr-orphan-p child)
                    "the child is held as an orphan, which is the branch under test")
-          (is-true (bl:recent-reject-p (bl.net:peer-announced-txs a) parent-id)
+          (is-true (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs a) parent-id)
                    "its parent is marked known to the peer that sent the child")
-          (is-false (bl:recent-reject-p (bl.net:peer-announced-txs b) parent-id)
+          (is-false (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs b) parent-id)
                     "and to nobody else")
           ;; Which is what stops the parent being announced back to A when we
           ;; do accept it.
@@ -937,7 +937,7 @@ misbehaviour sites, and leave that many permanent records behind, then
 reconnect from another address and repeat, so the per-peer cap stops bounding
 the total."
   (progn
-    (let ((bl.net::*discouraged-peers* (bl:make-rejects-filter 128))
+    (let ((bl.net::*discouraged-peers* nil)
           (bl.net:*banlist-path* nil))
       (%with-fresh-rejects (unused-rejects)
         (progn unused-rejects)
@@ -1139,7 +1139,7 @@ dropped and wait_for_invs_to_match timed out at p2p_feefilter.py:39."
               (setf (bl.net:peer-feefilter-rate peer) (1- per-kvb))
               (bl.net:announce-mempool-tx (list peer) mempool txid)
               (flush-peer-invs peer mempool)
-              (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) txid)
+              (is-true (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs peer) txid)
                        "the transaction clears a filter below its real rate"))))))))
 
 (test an-unsolicited-transaction-flood-keeps-its-sender-connected

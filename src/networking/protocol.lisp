@@ -1039,7 +1039,7 @@ the same 1000 that bounds an addr message) a new address REPLACES a uniformly
 random one rather than being appended or dropped, so a peer flooding us with
 addresses cannot decide which of the queued ones we pass on."
   (let ((queue (peer-addrs-to-send peer)))
-    (when (and (not (bl:recent-reject-p (peer-known-addrs peer)
+    (when (and (not (rolling-bloom-contains-p (peer-known-addrs peer)
                                         (%addr-gossip-key peer-addr)))
                (addr-compatible-p peer peer-addr))
       (if (>= (fill-pointer queue) bl.ser:+max-addr-count+)
@@ -1275,7 +1275,7 @@ Core counts it in neither num_proc nor num_rate_limit."
     ;; test below -- "remembering we received them" is exactly what the next
     ;; comment means by it.
     (when peer
-      (bl:add-recent-reject (peer-known-addrs peer) (%addr-gossip-key pa)))
+      (rolling-bloom-insert (peer-known-addrs peer) (%addr-gossip-key pa)))
     ;; Core: "Do not process banned/discouraged addresses beyond remembering we
     ;; received them" (net_processing.cpp:4094-4097). Its `continue` skips the
     ;; ++num_proc, the RelayAddress call and the vAddrOk push that feeds
@@ -2819,7 +2819,7 @@ gains entries while the onion service (which requires listening) is up. Call
           ;; The reset happens whether or not we end up with an address to
           ;; announce, as it does in Core (it precedes GetLocalAddrForPeer).
           (unless firstp
-            (bl:clear-recent-rejects (peer-known-addrs peer)))
+            (rolling-bloom-reset (peer-known-addrs peer)))
           (when (%announce-local-address peer firstp)
             (incf sent)))
         ;; Reschedule whether or not anything was sent (Core sets
@@ -2848,13 +2848,14 @@ the schedule. Core MaybeSendAddr, net_processing.cpp:5575-5604."
     (when (> (fill-pointer queue) bl.ser:+max-addr-count+)
       (setf (fill-pointer queue) bl.ser:+max-addr-count+))
     ;; Drop what the peer has learned since the push, marking the rest known
-    ;; on the same pass — which is exactly ADD-RECENT-REJECT's contract
-    ;; (NIL when the key was already there, T once it has been inserted), so
-    ;; Core's addr_already_known lambda is one clause here.
-    (let ((fresh (loop for pa across queue
-                       when (bl:add-recent-reject (peer-known-addrs peer)
-                                                  (%addr-gossip-key pa))
-                         collect pa)))
+    ;; on the same pass -- Core's addr_already_known lambda
+    ;; (net_processing.cpp:5582-5587): contains, and insert when not.
+    (let* ((known (peer-known-addrs peer))
+           (fresh (loop for pa across queue
+                        for key = (%addr-gossip-key pa)
+                        unless (rolling-bloom-contains-p known key)
+                          do (rolling-bloom-insert known key)
+                          and collect pa)))
       (setf (fill-pointer queue) 0)
       (let ((msg (and fresh (build-addr-response peer fresh))))
         (when msg
@@ -2997,8 +2998,8 @@ reach here anyway — their senders are disconnected)."
                  ;; InitiateTxBroadcastToAll's known-filter test,
                  ;; net_processing.cpp:2261-2263, over the same
                  ;; `m_wtxid_relay ? wtxid : txid` key).
-                 (not (bl:recent-reject-p (peer-announced-txs peer)
-                                          (%peer-inv-hash peer txid wtxid))))
+                 (not (rolling-bloom-contains-p (peer-announced-txs peer)
+                                                (%peer-inv-hash peer txid wtxid))))
         ;; BIP-330: a peer we reconcile with gets the transaction held back in
         ;; its reconciliation set rather than announced — unless this
         ;; transaction is one of the few chosen for immediate fanout, which is
@@ -3161,7 +3162,7 @@ left in, it would cost sketch capacity every round until a round happened to
 settle it. A reconciling peer negotiated wtxid relay, so HASH is the wtxid the
 set is keyed by. Core d3056bc has no set to remove from; the BIP is the
 oracle."
-  (bl:add-recent-reject (peer-announced-txs peer) hash)
+  (rolling-bloom-insert (peer-announced-txs peer) hash)
   (let ((set (peer-recon-set peer)))
     (when (and set (peer-recon-k0 peer))
       (recon-set-remove set (peer-recon-k0 peer) (peer-recon-k1 peer) hash))))
@@ -3289,7 +3290,7 @@ Core's `continue` before nRelayedTransactions++."
                ;; a filter nothing ever wrote.
                (let* ((inv (%peer-tx-inv peer txid wtxid))
                       (known (bl.ser:inv-vector-hash inv)))
-                 (when (and (not (bl:recent-reject-p
+                 (when (and (not (rolling-bloom-contains-p
                                   (peer-announced-txs peer) known))
                             ;; Evicted/confirmed since queueing => nothing to announce.
                             (or (null mempool)

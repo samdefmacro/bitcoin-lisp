@@ -125,23 +125,11 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; the remainder instead would make the peer wait out its own request
   ;; timeout for a block we had already read off disk.
   (getdata-queue '() :type list)
-  ;; Bounded set of transactions this peer already knows about: everything we
-  ;; have announced to it AND everything it has announced or sent to us (Core
-  ;; m_tx_inventory_known_filter, written by AddKnownTx). Keyed by the id this
-  ;; peer PREFERS -- wtxid once it negotiated wtxidrelay, txid otherwise, which
-  ;; is the id its own invs carry -- so every reader must build the inv first
-  ;; and look the filter up by that hash (net_processing.cpp:4491-4492,
-  ;; :6060-6069). Was an unbounded hash-table -- a per-peer memory leak on
-  ;; long-lived relay connections. Core bounds the equivalent at
-  ;; CRollingBloomFilter{50000}; we use the same hash+FIFO-ring bounded set as
-  ;; the recent-rejects filter.
-  (announced-txs (bl:make-rejects-filter 50000)
-                 :type bl:recent-rejects)
-  ;; Bounded set of addresses (ip||port keys) this peer already knows -- either
-  ;; it sent them to us or we relayed them to it. Dedup for addr gossip; Core's
-  ;; m_addr_known CRollingBloomFilter{5000}.
-  (known-addrs (bl:make-rejects-filter 5000)
-               :type bl:recent-rejects)
+  ;; The transactions this peer already knows about -- see PEER-ANNOUNCED-TXS
+  ;; -- and the addresses it already knows -- see PEER-KNOWN-ADDRS: Core's
+  ;; rolling bloom filters, built on first use.
+  (%announced-txs nil)
+  (%known-addrs nil)
   ;; Addresses waiting to be gossiped to this peer, in push order (Core
   ;; Peer::m_addrs_to_send, net_processing.cpp:343). RELAY-ADDRESS appends
   ;; here instead of sending; FLUSH-ADDR-ANNOUNCEMENTS empties the whole
@@ -363,6 +351,29 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; CNodeState::pindexBestHeaderSent), the second half of PeerHasHeader: a
   ;; header we just sent is one the peer has, even before it tells us so.
   (best-header-sent-hash nil))
+
+(defun peer-announced-txs (peer)
+  "The transactions PEER already knows about: everything we have announced to
+it AND everything it has announced or sent to us -- Core's
+m_tx_inventory_known_filter, a CRollingBloomFilter{50000, 0.000001}
+(net_processing.cpp:307), written by AddKnownTx. Keyed by the id this peer
+PREFERS -- wtxid once it negotiated wtxidrelay, txid otherwise, which is the
+id its own invs carry -- so every reader builds the inv first and looks the
+filter up by that hash (:4491-4492, :6060-6069). Built on first use: a
+block-relay-only peer never asks for it, as Core builds it only with the
+peer's TxRelay. 539 KB once built; the 50,000-entry ring it replaces took
+400 KB at peer creation and about 2 MB full."
+  (or (peer-%announced-txs peer)
+      (setf (peer-%announced-txs peer) (make-rolling-bloom-filter 50000 0.000001d0))))
+
+(defun peer-known-addrs (peer)
+  "The addresses (BIP155-typed ip||port keys) PEER already knows -- it sent
+them to us or we relayed them to it: Core's m_addr_known, a
+CRollingBloomFilter{5000, 0.001} built when address relay is set up for the
+peer (net_processing.cpp:353, :5707). 27 KB once built; the 5,000-entry ring
+took 40 KB at creation and about 200 KB full."
+  (or (peer-%known-addrs peer)
+      (setf (peer-%known-addrs peer) (make-rolling-bloom-filter 5000 0.001d0))))
 
 (defmethod bl.mp:orphan-peer-id ((peer peer))
   "The orphanage orders peers by Core's NodeId (LimitOrphans' tie-break,
@@ -2254,36 +2265,45 @@ Set at node startup; every manual-ban mutation dumps the file immediately,
 exactly like Core (banman.cpp:153,170,79 — Ban/Unban/ClearBanned each call
 DumpBanlist).")
 
-(defvar *discouraged-peers* (bl:make-rejects-filter)
-  "Bounded, ephemeral rolling set of discouraged peer addresses (strings).
-Mirrors Bitcoin Core's BanMan discourage filter: auto-populated on misbehavior,
-never persisted, and bounded (FIFO eviction) so a peer cannot grow it without
-limit. Reuses the recent-rejects ring+hashtable structure.")
+(defvar *discouraged-peers* nil
+  "Discouraged peer addresses: Core BanMan's m_discouraged, a
+CRollingBloomFilter{50000, 0.000001} (banman.h:98) -- ephemeral, never
+persisted, and bounded so a peer cannot grow it without limit. Built on first
+use (DISCOURAGED-FILTER).")
+
+(defun discouraged-filter ()
+  "*DISCOURAGED-PEERS*, built on first use."
+  (or *discouraged-peers*
+      (setf *discouraged-peers* (make-rolling-bloom-filter 50000 0.000001d0))))
 
 (defvar *ban-lock* (bt:make-lock "ban-lock")
-  "Guards *banned-peers* and *discouraged-peers* (their hash-table / ring-buffer
+  "Guards *banned-peers* and *discouraged-peers* (their hash-table / bloom
 mutations are not thread-safe). These are sync-thread-only today, so this is
 future-proofing for a cross-thread writer (e.g. a setban RPC). Lock order is
 always node-lock -> ban-lock (the readers run standalone or already under
 node-lock), never the reverse, so it cannot deadlock against node-lock.")
 
 (defun discourage-peer (address)
-  "Mark ADDRESS as discouraged (bounded rolling filter)."
+  "Mark ADDRESS as discouraged (Core BanMan::Discourage, banman.cpp:124-128,
+which inserts the address bytes; ours are the address string's)."
   (when (and address (plusp (length address)))
     (bt:with-lock-held (*ban-lock*)
-      (bl:add-recent-reject *discouraged-peers* address))))
+      (rolling-bloom-insert (discouraged-filter) (bl.bytes:utf8-string-to-bytes address)))))
 
 (defun peer-discouraged-p (address)
-  "T if ADDRESS is currently discouraged."
+  "T if ADDRESS is currently discouraged (Core BanMan::IsDiscouraged,
+banman.cpp:84-87)."
   (and address (plusp (length address))
        (bt:with-lock-held (*ban-lock*)
-         (bl:recent-reject-p *discouraged-peers* address))
+         (rolling-bloom-contains-p (discouraged-filter) (bl.bytes:utf8-string-to-bytes address)))
        t))
 
 (defun clear-discouraged ()
-  "Clear the discourage filter."
+  "Clear the discourage filter -- an operator's and a test's convenience; Core
+never clears m_discouraged (BanMan::ClearBanned, banman.cpp:72-81, clears
+only the ban list)."
   (bt:with-lock-held (*ban-lock*)
-    (bl:clear-recent-rejects *discouraged-peers*)))
+    (rolling-bloom-reset (discouraged-filter))))
 
 (defun loopback-address-p (address)
   "T when ADDRESS is a loopback address — Core CNetAddr::IsLocal

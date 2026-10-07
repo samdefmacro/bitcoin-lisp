@@ -841,7 +841,7 @@ was never lifted, so our address could never have ridden the queue at all."
           ;; which is what the reset is for: mark our address known (what a
           ;; flush of the previous one does) and it must still be queued.
           (setf (fill-pointer (%addr-queue peer)) 0)
-          (bl:add-recent-reject
+          (bl.net:rolling-bloom-insert
            (bl.net:peer-known-addrs peer)
            (bl.net::%addr-gossip-key
             (bl.net:make-peer-address :net :ipv4 :ip ip :port 8333)))
