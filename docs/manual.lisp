@@ -1430,7 +1430,11 @@
   CheckSig. An execution's state is one mutable ScriptContext, allocated
   when the execution starts and updated in place (Core's EvalScript
   locals); every opcode threads it linearly, reading what it needs before
-  it sets. Core: `script/interpreter.cpp`,
+  it sets. Nothing in it may cost more than O(1) per opcode, because
+  tapscript has no script-size cap: the IF/ELSE/ENDIF conditions are
+  Core's ConditionStack (a size and the first false position), and the
+  BIP 342 code-separator position is Core's running opcode count, never a
+  rescan of the script. Core: `script/interpreter.cpp`,
   `script/script.cpp`, `script/sigcache.cpp`. Settled policy: the
   interpreter stays Coalton; everything else is CL.
 
