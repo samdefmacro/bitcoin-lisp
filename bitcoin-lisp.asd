@@ -694,6 +694,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/crypto-diff-fuzz-chacha20")
                              (:file "fuzz/crypto-poly1305")
                              (:file "fuzz/crypto-aes256cbc")
+                             (:file "fuzz/secp256k1-ecdsa-signature-parse-der-lax")
                              (:file "fuzz/p2p-headers-presync")
                              (:file "fuzz/connman")
                              (:file "fuzz/p2p-handshake")
