@@ -1458,3 +1458,39 @@ empty signature and succeeds (:1093-1102)."
                       (bl.interop:script-error-name (bl.script:script-result-error r))))
           "flags naming TAPSCRIPT ran a BASE script under tapscript rules"))
     (is-true (script-ok-p (call-execute-tapscript script)))))
+
+;;; ============================================================
+;;; The condition stack is O(1) per IF/ELSE/ENDIF (Core's ConditionStack)
+;;; ============================================================
+
+(defun %nested-if-tapscript (n)
+  "N nested executed `OP_1 OP_IF', then OP_1, then N OP_ENDIFs."
+  (concatenate 'simple-vector
+               (loop repeat n append (list #x51 #x63))
+               (list #x51)
+               (make-list n :initial-element #x68)))
+
+(defun %tapscript-run-ms (script)
+  "(values ok-p milliseconds) of SCRIPT run once as SigVersion::TAPSCRIPT."
+  (let* ((t0 (get-internal-real-time))
+         (ok (script-ok-p (call-execute-tapscript script))))
+    (values ok (/ (* 1000 (- (get-internal-real-time) t0))
+                  internal-time-units-per-second))))
+
+(test nested-ifs-cost-linear-time
+  "Core keeps vfExec as a ConditionStack -- the implied stack's size and the
+position of its first false value, so push_back, pop_back, toggle_top and
+all_true are O(1) (script/interpreter.cpp:273-318, used at :425-440 and
+:633-649). Ours kept the list and re-walked it on every IF, ELSE and ENDIF to
+recompute whether all were true: N nested executed IFs cost O(N^2), and
+tapscript has no MAX_SCRIPT_SIZE to bound N -- 80,000 (a 240 KB script) took
+9.5 s. Linear now: the 80,000 case under one second, and quadrupling N from
+20,000 must not cost the sixteen-fold a quadratic walk does (bounded at 8x,
+with a 50 ms floor for timer granularity)."
+  (multiple-value-bind (ok20 ms20) (%tapscript-run-ms (%nested-if-tapscript 20000))
+    (multiple-value-bind (ok80 ms80) (%tapscript-run-ms (%nested-if-tapscript 80000))
+      (is-true ok20)
+      (is-true ok80)
+      (is (< ms80 1000) "80,000 nested IFs took ~D ms" (round ms80))
+      (is (< ms80 (* 8 (max ms20 50)))
+          "20,000 nested IFs ~D ms, 80,000 ~D ms: not linear" (round ms20) (round ms80)))))
