@@ -68,16 +68,20 @@ connecting a block off that path. NIL TARGET-ENTRY clears the target."
      (setf (chain-state-target-blockhash chain-state) nil
            (chain-state-target-ancestors chain-state) nil))
     (t
-     (let* ((target-height (block-index-entry-height target-entry))
-            (ancestors (make-array (1+ target-height) :initial-element nil)))
-       (loop with entry = target-entry
-             while entry
-             do (setf (aref ancestors (block-index-entry-height entry)) entry)
-                (setf entry (block-index-entry-prev-entry entry)))
-       (setf (chain-state-target-blockhash chain-state)
-             (block-index-entry-hash target-entry)
-             (chain-state-target-ancestors chain-state) ancestors))))
+     (setf (chain-state-target-blockhash chain-state)
+           (block-index-entry-hash target-entry)
+           (chain-state-target-ancestors chain-state)
+           (entry-ancestor-vector target-entry))))
   target-entry)
+
+(defun entry-ancestor-vector (entry)
+  "ENTRY's ancestors by height, ENTRY included: a simple-vector whose element
+H is the ancestor at height H -- O(1) GetAncestor along one path."
+  (let ((ancestors (make-array (1+ (block-index-entry-height entry)) :initial-element nil)))
+    (loop for e = entry then (block-index-entry-prev-entry e)
+          while e
+          do (setf (svref ancestors (block-index-entry-height e)) e))
+    ancestors))
 
 (defun clear-snapshot-chainstate-identity (state)
   "Reset STATE's assumeutxo/snapshot identity so it is a plain, fully-validated
@@ -324,22 +328,28 @@ NETWORK defaults to bl.chain:*network* if not specified."
      :best-block-hash (or genesis-hash (network-genesis-hash net))
      :best-height 0)))
 
-(defun %record-block-position (entry located)
+(defun %record-block-position (entry located &key tx-count)
   "Copy LOCATED's file and offset onto ENTRY, and return ENTRY. NIL entry or a
 non-flat LOCATED leaves the position alone — a legacy per-block file leaves the
 fields NIL, which is exactly what NIL means here.
 
 Any stored body, in either form, is a body received by this node, which is what
 Core's ReceivedBlockTransactions marks BLOCK_OPT_WITNESS where segwit applies
-(validation.cpp:3817-3819); NOTE-BLOCK-WITNESS-RECEIVED does that here."
+(validation.cpp:3817-3819); NOTE-BLOCK-WITNESS-RECEIVED does that here. It also
+sets nTx, the body's transaction count (:3812), which TX-COUNT is: given, it is
+recorded with the position, so a body stored without being connected still
+says how many transactions it holds -- what blocks/index records and what
+CheckBlockIndex's `nTx > 0 iff VALID_TRANSACTIONS' reads."
   (when (and entry (flat-file-pos-p located))
     (setf (block-index-entry-file entry) (flat-file-pos-file located)
           (block-index-entry-data-pos entry) (flat-file-pos-pos located)))
   (when (and entry located)
+    (when tx-count
+      (setf (block-index-entry-tx-count entry) tx-count))
     (note-block-witness-received entry))
   entry)
 
-(defun note-block-position (chain-state hash located)
+(defun note-block-position (chain-state hash located &key tx-count)
   "Record on HASH's index entry where its body landed, and return the entry.
 
 LOCATED is STORE-BLOCK's second value: a FLAT-FILE-POS for a record inside a
@@ -352,10 +362,12 @@ record is written into the file its block occupies and is addressed by nothing
 but nUndoPos on this entry. A legacy per-block file leaves them NIL, which is
 exactly what NIL means here — not in a flat file, so no rev file to pair with.
 
+TX-COUNT is the body's transaction count, Core's nTx (%RECORD-BLOCK-POSITION).
+
 No entry yet is not an error: the caller that adds the entry afterwards notes
 the position once it exists."
   (let ((entry (and chain-state (get-block-index-entry chain-state hash))))
-    (%record-block-position entry located)
+    (%record-block-position entry located :tx-count tx-count)
     (when located (note-block-received chain-state entry))
     entry))
 
@@ -418,18 +430,36 @@ part of Core's ChainstateManager reset that concerns sequence ids."
   (setf *block-reverse-sequence-id* -1
         *last-precious-chainwork* 0))
 
+(defun %snapshot-base-entry (chain-state)
+  "The snapshot base's entry when CHAIN-STATE was loaded from a snapshot, else
+NIL: below it, CHAIN-STATE's active chain is headers only."
+  (let ((hash (and chain-state (chain-state-from-snapshot-blockhash chain-state))))
+    (and hash (get-block-index-entry chain-state hash))))
+
 (defun %entry-have-chain-txs-p (chain-state entry)
-  "Core CBlockIndex::HaveNumChainTxs: ENTRY and every ancestor hold a body. An
-entry with an assigned sequence id, or on the active chain, answers at once;
-one still at +SEQ-ID-INIT-FROM-DISK+ (a block loaded from disk off the active
-chain) walks down while each entry has a recorded position."
-  (loop for e = entry then (block-index-entry-prev-entry e)
-        do (cond ((null e) (return t))
-                 ((/= (block-index-entry-sequence-id e) +seq-id-init-from-disk+)
-                  (return t))
-                 ((and chain-state (entry-on-active-chain-p chain-state e))
-                  (return t))
-                 ((null (block-index-entry-data-pos e)) (return nil)))))
+  "Core CBlockIndex::HaveNumChainTxs: ENTRY and every ancestor have had their
+transactions received (nTx > 0, the body held or pruned since), or the walk
+reaches the snapshot base, whose count the snapshot supplies
+(validation.cpp:5966). An entry with an assigned sequence id answers at once
+-- NOTE-BLOCK-RECEIVED hands one out only to such a chain -- and so does one
+on CHAIN-STATE's active chain, but on a snapshot chainstate only from the base
+up: the snapshot chain below the base was never downloaded, and a stale block
+submitted on top of it waits in m_blocks_unlinked (feature_assumeutxo.py:606-
+612)."
+  (let* ((base (%snapshot-base-entry chain-state))
+         (active-floor (if base (block-index-entry-height base) 0)))
+    (loop for e = entry then (block-index-entry-prev-entry e)
+          do (cond ((null e) (return t))
+                   ((> (block-index-entry-sequence-id e) +seq-id-init-from-disk+)
+                    (return t))
+                   ((eq e base) (return t))
+                   ((and chain-state
+                         (>= (block-index-entry-height e) active-floor)
+                         (entry-on-active-chain-p chain-state e))
+                    (return t))
+                   ((and (zerop (block-index-entry-tx-count e))
+                         (null (block-index-entry-data-pos e)))
+                    (return nil))))))
 
 (defun note-block-received (chain-state entry)
   "Core ReceivedBlockTransactions' candidate half (validation.cpp:3829-3853):
@@ -439,8 +469,20 @@ it, breadth first in arrival order; otherwise ENTRY waits in *BLOCKS-UNLINKED*
 under its parent. An entry that already has an id keeps it -- Core does not
 re-run this for a body it already holds (validation.cpp:4350)."
   (when (and entry
-             (= (block-index-entry-sequence-id entry) +seq-id-init-from-disk+)
-             (not (and chain-state (entry-on-active-chain-p chain-state entry))))
+             ;; Not yet given a receive id. SEQ_ID_BEST_CHAIN_FROM_DISK (0)
+             ;; and preciousblock's negative ids are not one: a snapshot
+             ;; chain's base carries 0 after a restart with no body yet, and
+             ;; Core's ReceivedBlockTransactions runs for its body all the same.
+             (<= (block-index-entry-sequence-id entry) +seq-id-init-from-disk+)
+             ;; An active-chain block was connected, so its chain is complete
+             ;; -- except on a snapshot chainstate up to its base, which is
+             ;; headers only there; Core parks even the base's own body
+             ;; (feature_assumeutxo.py:660-667).
+             (not (and chain-state
+                       (> (block-index-entry-height entry)
+                          (let ((base (%snapshot-base-entry chain-state)))
+                            (if base (block-index-entry-height base) -1)))
+                       (entry-on-active-chain-p chain-state entry))))
     (let ((parent (block-index-entry-prev-entry entry)))
       (if (or (null parent) (%entry-have-chain-txs-p chain-state parent))
           (let ((queue (list entry)))
@@ -459,6 +501,47 @@ re-run this for a body it already holds (validation.cpp:4350)."
               (setf (gethash key *blocks-unlinked*)
                     (append (gethash key *blocks-unlinked*) (list entry))))))))
   entry)
+
+(defun drop-unlinked-block (entry)
+  "Core PruneOneBlockFile's m_blocks_unlinked half (node/blockstorage.cpp:
+273-284): ENTRY's body is gone, so it no longer waits on its parent -- were it
+fetched again, its arrival would decide that afresh."
+  (let* ((parent (block-index-entry-prev-entry entry))
+         (key (and parent (block-index-entry-hash parent)))
+         (waiting (and key (gethash key *blocks-unlinked*))))
+    (when (member entry waiting :test #'eq)
+      (let ((rest (remove entry waiting :test #'eq)))
+        (if rest
+            (setf (gethash key *blocks-unlinked*) rest)
+            (remhash key *blocks-unlinked*))))))
+
+(defun link-unlinked-bodies (chain-state &optional snapshot-base-hash)
+  "Core LoadBlockIndex's m_blocks_unlinked half (node/blockstorage.cpp:
+470-486), over the index as loaded: walking up the heights, a block whose
+transactions were received (nTx > 0) has every ancestor's transactions when
+its parent does -- or when it is the snapshot base, whose count the snapshot
+supplies -- and otherwise waits in *BLOCKS-UNLINKED* under its parent, as
+NOTE-BLOCK-RECEIVED would have parked it. Without this a restart forgot every
+parked body, and the parent's arrival never handed it a sequence id."
+  (let ((entries '())
+        (have (make-hash-table :test 'eq)))
+    (maphash (lambda (hash entry)
+               (declare (ignore hash))
+               (push entry entries))
+             (chain-state-block-index chain-state))
+    (dolist (entry (sort entries #'< :key #'block-index-entry-height))
+      (let ((parent (block-index-entry-prev-entry entry)))
+        (cond ((and snapshot-base-hash
+                    (equalp (block-index-entry-hash entry) snapshot-base-hash))
+               ;; Its count comes from the snapshot, whatever its own nTx
+               ;; (blockstorage.cpp:438-443).
+               (setf (gethash entry have) t))
+              ((zerop (block-index-entry-tx-count entry)))
+              ((or (null parent) (gethash parent have))
+               (setf (gethash entry have) t))
+              (t
+               (push entry (gethash (block-index-entry-hash parent)
+                                    *blocks-unlinked*))))))))
 
 (defun entry-better-p (a b)
   "T when A beats B as a chain tip -- Core CBlockIndexWorkComparator

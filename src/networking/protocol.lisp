@@ -848,7 +848,10 @@ never received the branch's blocks."
                (when (and (consp reorg-outcome)
                           (null (first reorg-outcome))
                           (bl.val:reorg-missing-blocks-p (second reorg-outcome)))
-                 (queue-missing-fork-blocks (second reorg-outcome))))))
+                 (queue-missing-fork-blocks (second reorg-outcome))))
+             ;; AcceptBlock's and ActivateBestChain's closing CheckBlockIndex
+             ;; (validation.cpp:4425, :3517): CONNECT-BLOCK did both.
+             (bl.val:check-block-index chain-state)))
       ;; Core's two AcceptBlockHeader gates, which this path had neither of --
       ;; it branched only on whether the parent is the tip.
       ;;

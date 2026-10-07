@@ -605,7 +605,7 @@ gated getheaders from an ungated one."
      (is-false (bl.net:peer-discouraged-p addr))
      (is (eq :ready (bl.net:peer-state peer))))))
 
-(test cmpctblock-invalid-reconstruction-refetches-instead-of-discouraging
+(synthetic-index-test cmpctblock-invalid-reconstruction-refetches-instead-of-discouraging
   "GA8 W4. When the parent IS known and reconstruction succeeds but the block
 fails validation, fall back to a full-block getdata -- never discourage.
 
@@ -644,7 +644,7 @@ reconstruction -- otherwise this test would see a getheaders here."
                "a compact block that fails validation must not discourage its sender")
      (is (eq :ready (bl.net:peer-state peer))))))
 
-(test cmpctblock-structurally-malformed-still-punishes
+(synthetic-index-test cmpctblock-structurally-malformed-still-punishes
   "GA8 W4 control: removing the punishment for INVALID blocks must not remove
 the punishment for INVALID MESSAGES. A prefilled transaction whose index lies
 outside the block is Core's READ_STATUS_INVALID (blockencodings.cpp:78-84),
@@ -785,7 +785,7 @@ BLOCK_INVALID_HEADER (validation.cpp:3864). Each test asserts the miss."
           (bl.ser:block-header-cached-hash h) nil)
     h))
 
-(test cmpctblock-invalid-header-punishes-and-never-hashes-the-mempool
+(synthetic-index-test cmpctblock-invalid-header-punishes-and-never-hashes-the-mempool
   "GA8 W4 blocker. A cmpctblock whose HEADER fails proof of work, announced on a
 parent we DO have, must discourage and disconnect its sender — through the
 compact path, exactly as Core does at net_processing.cpp:4589-4591 — and must
@@ -1001,7 +1001,7 @@ from the same four pieces every time."
    (bl.ctx:make-node-context :chain-state state :utxo-set utxo
                             :mempool mempool)))
 
-(test cmpctblock-low-work-header-is-ignored-before-the-mempool
+(synthetic-index-test cmpctblock-low-work-header-is-ignored-before-the-mempool
   "GA10 S1. Core ignores a compact block whose announced chain misses the
 anti-DoS work floor — `prev_block->nChainWork + GetBlockProof(cmpctblock.header)
 < GetAntiDoSWorkThreshold()' (net_processing.cpp:4578-4582) — outright, before
@@ -1080,7 +1080,7 @@ fixture that never reconstructs anything."
              "control: with the floor at zero the same header must reach the mempool, passes: ~D"
              passes))))))
 
-(test cmpctblock-indexes-the-announced-header-and-drops-the-replay
+(synthetic-index-test cmpctblock-indexes-the-announced-header-and-drops-the-replay
   "GA10 S1, the other half. Core's handler calls
 ProcessNewBlockHeaders({{cmpctblock.header}}) (net_processing.cpp:4590), whose
 AcceptBlockHeader ends in AddToBlockIndex — so the announced header is in the
@@ -1136,7 +1136,7 @@ count can pass on a fixture that does nothing."
                  "a replayed compact block is not a fault Core scores")
        (is (eq :ready (bl.net:peer-state peer)))))))
 
-(test cmpctblock-invalid-header-is-punished-and-never-indexed
+(synthetic-index-test cmpctblock-invalid-header-is-punished-and-never-indexed
   "The risk the index write creates: the announced header may be inserted only
 AFTER it passes the header battery. Core's order is exactly that —
 AcceptBlockHeader inserts at its end, after CheckBlockHeader and
@@ -2127,7 +2127,7 @@ valid-yet-unconnected case, not a rejection")
 
 ;;;; The getblocktxn round trip is a block download (p2p_mutated_blocks.py:78)
 
-(test a-compact-block-awaiting-getblocktxn-is-in-flight
+(synthetic-index-test a-compact-block-awaiting-getblocktxn-is-in-flight
   "Core marks the block IN FLIGHT against the peer before it even builds the
 getblocktxn (BlockRequested, net_processing.cpp:4668): the round trip is a
 block download like any other. mapBlocksInFlight is what stops the scheduler
@@ -2224,7 +2224,7 @@ BLOCK-HASH bound to the announced block."
                        (%cbp-deliver peer ,payload ,state ,utxo ,mempool)))))
              ,@body))))))
 
-(test the-last-parallel-compact-block-slot-is-kept-for-an-outbound-peer
+(synthetic-index-test the-last-parallel-compact-block-slot-is-kept-for-an-outbound-peer
   "Core's mapBlocksInFlight is a multimap: up to MAX_CMPCTBLOCKS_INFLIGHT_PER_
 BLOCK (3, net_processing.h:48) peers may each run a getblocktxn round trip for
 the same block (net_processing.cpp:4665), and the peer first in line always
@@ -2261,7 +2261,7 @@ four were sent a getblocktxn, and :929 caught the third."
         (is (equalp (list block-hash) (bl.net:peer-inflight-block-hashes holder))
             "each of the three is in flight for the block (getpeerinfo inflight)")))))
 
-(test an-outbound-holder-opens-the-last-compact-block-slot-to-inbound-peers
+(synthetic-index-test an-outbound-holder-opens-the-last-compact-block-slot-to-inbound-peers
   "The other arm of Core's last-slot rule (net_processing.cpp:4711): once an
 OUTBOUND peer is among the block's holders, `we already have an outbound
 attempt in flight (so we'll take what we can get)', and a high-bandwidth
@@ -2360,7 +2360,7 @@ as a fork, so nobody was punished."
                            (bl.store:get-block-index-entry cs bad-hash)))
              "the verdict is cached on the block's index entry"))))))
 
-(test a-second-blocktxn-after-a-failed-reconstruction-is-punished
+(synthetic-index-test a-second-blocktxn-after-a-failed-reconstruction-is-punished
   "Core's FillBlock runs ONCE per reconstruction: it wipes the partial block's
 header before judging the result (blockencodings.cpp:210-212). A filled block
 that is mutated -- most likely a short-ID collision -- is READ_STATUS_FAILED
@@ -2450,7 +2450,7 @@ waits for a cmpctblock."
           (is (null (bl.net:new-pow-valid-block cs entry2 (list (peer "198.51.100.73" t))))
               "each height is pushed once"))))))
 
-(test a-new-compact-header-no-better-than-the-tip-is-indexed-but-not-rebuilt
+(synthetic-index-test a-new-compact-header-no-better-than-the-tip-is-indexed-but-not-rebuilt
   "Core indexes a cmpctblock's header (ProcessNewBlockHeaders, net_processing.cpp
 :4590) and THEN returns when `pindex->nChainWork <= ActiveChain().Tip()->
 nChainWork' (:4645-4655), so an old fork's compact block leaves a headers-only

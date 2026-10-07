@@ -379,6 +379,14 @@
 ;; Absent, the chain's fDefaultConsistencyChecks decides: 1 on regtest, 0
 ;; elsewhere (init.cpp:1316). The drive sites are BL.VAL:CHECK-MEMPOOL-AT-TIP's.
 (define-option "checkmempool" :type :int :global bl.mp:*mempool-check-ratio*)
+;; -checkblockindex=<n>: run CheckBlockIndex on one call in N, 0 never (Core
+;; node/chainstatemanager_args.cpp:27-30, which reads an EMPTY value -- Core's
+;; bare flag, and our `-checkblockindex=' -- as 1). Absent, the chain's
+;; fDefaultConsistencyChecks decides, as for -checkmempool. The drive sites
+;; are BL.VAL:CHECK-BLOCK-INDEX's.
+(define-option "checkblockindex"
+  :apply (lambda (v)
+           (setf bl.val:*check-block-index* (if (string= v "") 1 (conf-parse-int v)))))
 ;; -maxmempool: megabytes of mempool MEMORY usage (Core mempool_args.cpp,
 ;; DEFAULT_MAX_MEMPOOL_SIZE_MB = 300). Read by make-mempool. Under
 ;; -blocksonly Core soft-sets it to 5 MB -- the absent case, in
@@ -620,7 +628,6 @@
 ;;; init/common.cpp, chainparamsbase.cpp, the wallet/index/zmq/rpc modules).
 
 (define-core-only-options
-  "checkblockindex"
   "checkpoints" "daemon"
   "daemonwait" "deprecatedrpc"
   ;; -help and SetupHelpOptions' hidden -h and -? (common/args.cpp:722-726).

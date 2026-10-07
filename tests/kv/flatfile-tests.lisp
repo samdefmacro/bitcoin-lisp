@@ -752,10 +752,12 @@ fall out of step."
   "A structural guard, for the same reason as the txindex one. A block stored
 without its height silently makes its whole FILE unprunable, and a pruned node
 that stops reclaiming space says nothing about it until the disk fills. There
-are five call sites -- two in ACTIVATE-BLOCK collapsed onto
+are three call sites -- two in ACTIVATE-BLOCK collapsed onto
 %STORE-ACCEPTED-BLOCK-BODY when Core's AcceptBlock gate landed in front of
-them, and %REFETCH-PRUNED-BODY writes back the body of a block whose own file
-was pruned (getblockfrompeer) -- and a sixth that forgets is how this returns."
+them, and the download path's three body-only stores (%REFETCH-PRUNED-BODY's
+write-back of a block whose own file was pruned among them) collapsed onto
+%STORE-BLOCK-BODY with AcceptBlock's CheckBlockIndex -- and a fourth that
+forgets is how this returns."
   (let ((sites '()))
     (dolist (rel '("src/validation/block.lisp" "src/networking/ibd.lisp"))
       (let ((src (uiop:read-file-string
@@ -765,8 +767,8 @@ was pruned (getblockfrompeer) -- and a sixth that forgets is how this returns."
               while pos
               do (push (subseq src pos (min (length src) (+ pos 400))) sites)
                  (setf start (+ pos 10)))))
-    (is (= 5 (length sites))
-        "expected 5 store-block call sites; a new one needs :height too")
+    (is (= 3 (length sites))
+        "expected 3 store-block call sites; a new one needs :height too")
     (dolist (form sites)
       (is (search ":height" form)
           "a store-block call omits :height, which makes its block file
@@ -1264,6 +1266,36 @@ incomplete. Running it twice adds nothing the second time."
            "the first rebuild fills an index that only knew genesis")
        (is (= 0 (bl.store:reindex-block-index store cs))
            "and a second pass adds nothing")))))
+
+(test a-reindexed-entry-carries-its-transaction-count
+  "Core's reindex reaches ReceivedBlockTransactions through AcceptBlock, which
+sets nTx (validation.cpp:3812); a rebuilt entry claims a body, so it says how
+many transactions the body holds -- read from the CompactSize after the
+header, without deserializing the block. It used to stay 0, an entry with
+HAVE_DATA and nTx = 0 that Core's CheckBlockIndex refuses."
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
+     (let* ((bl.store:*flat-block-files* t)
+            (store (bl.store:init-block-store dir))
+            (cs (bl.store:init-chain-state dir))
+            (genesis (bl.store:best-block-hash cs))
+            (blocks '()))
+       (bl.store:add-block-index-entry
+        cs (bl.store:make-block-index-entry
+            :hash genesis :height 0 :chain-work 1 :status :valid))
+       (let ((prev genesis))
+         (loop for h from 1 to 2
+               do (let ((b (%ff-chain-block prev (+ 250 h) h)))
+                    (bl.store:store-block store b :height h)
+                    (push b blocks)
+                    (setf prev (bl.ser:block-header-hash
+                                (bl.ser:bitcoin-block-header b))))))
+       (is (= 2 (bl.store:reindex-block-index store cs)))
+       (dolist (b blocks)
+         (let ((entry (bl.store:get-block-index-entry
+                       cs (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b)))))
+           (is (= (length (bl.ser:bitcoin-block-transactions b))
+                  (bl.store:block-index-entry-tx-count entry)))))))))
 
 (defun %ff-datadir-with-three-blocks (dir)
   "DIR as a datadir holding three stored blocks above genesis and NO persisted

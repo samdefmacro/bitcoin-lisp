@@ -123,7 +123,8 @@ the caller must treat as a reason to stop, not to continue."
                    ;; flat file" and its undo data could never be migrated,
                    ;; because a rev record has to know its block's file number.
                    (%record-block-position
-                    entry (gethash hash (block-store-index store)))
+                    entry (gethash hash (block-store-index store))
+                    :tx-count (length (bl.ser:bitcoin-block-transactions block)))
                    :migrated)
                   (t
                    ;; Keeping the per-block file is not enough on its own:

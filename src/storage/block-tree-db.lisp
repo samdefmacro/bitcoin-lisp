@@ -41,6 +41,7 @@
 
 (defconstant +block-valid-tree+ 2 "Core BLOCK_VALID_TREE.")
 (defconstant +block-valid-transactions+ 3 "Core BLOCK_VALID_TRANSACTIONS.")
+(defconstant +block-valid-chain+ 4 "Core BLOCK_VALID_CHAIN.")
 (defconstant +block-valid-scripts+ 5 "Core BLOCK_VALID_SCRIPTS.")
 (defconstant +block-valid-mask+ 7 "Core BLOCK_VALID_MASK.")
 (defconstant +block-have-data+ 8 "Core BLOCK_HAVE_DATA.")
@@ -140,18 +141,22 @@ block that had reached BLOCK_VALID_SCRIPTS, :header-valid otherwise."
 
 (defun entry-disk-status (entry)
   "ENTRY's Core nStatus. The validity level comes from the status keyword and
-from whether the body is held (a body we hold has passed Core's
-BLOCK_VALID_TRANSACTIONS, validation.cpp:3829); HAVE_DATA and HAVE_UNDO are the
-positions' presence; FAILED_VALID is :invalid; the rest is STATUS-FLAGS."
+from whether the body was ever received -- ReceivedBlockTransactions raises a
+block to BLOCK_VALID_TRANSACTIONS when its body arrives and pruning the body
+later does not lower it (validation.cpp:3829, blockstorage.cpp:266-267), so a
+held body or a recorded transaction count (nTx) both mean TRANSACTIONS;
+HAVE_DATA and HAVE_UNDO are the positions' presence; FAILED_VALID is :invalid;
+the rest is STATUS-FLAGS."
   (let* ((data (block-index-entry-data-pos entry))
+         (received (or data (plusp (block-index-entry-tx-count entry))))
          (status (block-index-entry-status entry))
          (flags (block-index-entry-status-flags entry))
          (level (ecase status
                   (:unknown 0)
                   (:valid +block-valid-scripts+)
-                  (:header-valid (if data +block-valid-transactions+ +block-valid-tree+))
+                  (:header-valid (if received +block-valid-transactions+ +block-valid-tree+))
                   (:invalid (max (logand flags +block-valid-mask+)
-                                 (if data +block-valid-transactions+ +block-valid-tree+))))))
+                                 (if received +block-valid-transactions+ +block-valid-tree+))))))
     (logior level
             (if data +block-have-data+ 0)
             (if (block-index-entry-undo-pos entry) +block-have-undo+ 0)

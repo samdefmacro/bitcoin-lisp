@@ -188,9 +188,15 @@ Returns the number of blocks re-offered."
         (return-from reaccept-unwitnessed-active-chain 0))
       (dolist (e ascending)
         (bl.store:forget-block-body store (bl.store:block-index-entry-hash e))
+        ;; Header-only again: no position, no undo, no transaction count and
+        ;; no sequence id (Core's nTx is 0 and nSequenceId SEQ_ID_INIT_FROM_DISK
+        ;; until ReceivedBlockTransactions, chain.h:147-160) -- the
+        ;; re-acceptance below sets them as it stores each body.
         (setf (bl.store:block-index-entry-file e) nil
               (bl.store:block-index-entry-data-pos e) nil
               (bl.store:block-index-entry-undo-pos e) nil
+              (bl.store:block-index-entry-tx-count e) 0
+              (bl.store:block-index-entry-sequence-id e) bl.store:+seq-id-init-from-disk+
               (bl.store:block-index-entry-status e) :header-valid))
       (loop for body in bodies
             when body
