@@ -91,6 +91,8 @@ scripts/dev.sh test :bitcoin-core-script-tests   # one fiveam suite (raw designa
 scripts/dev.sh test-all         # full :bitcoin-lisp-tests (29k+ checks; long)
 scripts/dev.sh docs-check       # PAX transcripts (docs/manual.lisp), cold container
 scripts/dev.sh ui-test          # web UI node harness (tests/ui/), cold container
+scripts/dev.sh ghost-check      # definitions the warm image holds that the source does not
+                                # (dev.sh test refuses to run over them; DEV_ALLOW_GHOSTS=1)
 scripts/dev.sh stop
 ```
 
