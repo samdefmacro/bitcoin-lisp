@@ -463,8 +463,9 @@
   (bitcoin-lisp.config:config-parse-error condition)
   (bitcoin-lisp.config:cli-parse-error condition)
   (bitcoin-lisp.config:option-definition-error condition)
-  "The command line becomes an ordered alist of lower-case names and raw
-  strings; a bare flag is `1`:
+  "The command line becomes an ordered alist of names, as written -- no
+  source folds case, as in Core off WIN32 -- and raw strings; a bare flag is
+  `1`, and a bare `-` ends the options:
 
   ```cl-transcript
   (bitcoin-lisp.config:parse-cli-args '(\"-regtest\" \"-maxconnections=8\"))

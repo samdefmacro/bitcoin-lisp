@@ -3166,13 +3166,36 @@ unrecognised. Both follow Core now, which for that key means the warning."
              (bl:unknown-settings-keys '(("LogSourceLocations" . "1")
                                          ("logsourcelocations" . "1")
                                          ("dbcache" . "100")))))
-  ;; And the CLI/config parsers still hand both predicates lower-case names,
-  ;; so a mixed-case spelling from those sources keeps working.
-  (is (equal '(("logsourcelocations" . "1"))
+  ;; And no parser folds a name either (args.cpp:182-243 off WIN32,
+  ;; config.cpp:99-118): a mixed-case spelling is refused on the command
+  ;; line and ignored with a warning in bitcoin.conf, as in Core. These two
+  ;; checks used to pin the opposite -- both parsers lower-cased every key,
+  ;; so the spelling worked here and nowhere in Core.
+  (signals bl.cfg:cli-parse-error (bl.cfg:check-cli-args '("-LogSourceLocations=1")))
+  (is (equal '(("LogSourceLocations" . "1"))
              (bl.cfg:parse-cli-args '("-LogSourceLocations=1"))))
-  (is (equal '("logsourcelocations")
-             (bl.cfg:supplied-core-only-options
-              (bl.cfg:parse-cli-args '("-LogSourceLocations=1"))))))
+  (is (equal '("LogSourceLocations")
+             (bl.cfg:unknown-config-file-keys
+              (bl.cfg:parse-bitcoin-conf (format nil "LogSourceLocations=1~%dbcache=4~%"))))))
+
+(test command-line-tokens-are-read-as-cores-parseparameters
+  "Core ParseParameters (common/args.cpp:182-243): a bare `-' ends the options
+(:193) and nothing after it is read; `--key' loses one dash more than `-key'
+and no further one (:223-227), so `---key' and a bare `--' name no option and
+are `Invalid parameter', reported with the token as given (:229-238). Ours
+stripped every leading dash and read on past `-'."
+  (is (equal '(("dbcache" . "7")) (bl.cfg:parse-cli-args '("--dbcache=7"))))
+  (finishes (bl.cfg:check-cli-args '("--dbcache=7" "-nolisten")))
+  (dolist (token '("---dbcache=5" "--" "--=1"))
+    (is (search (format nil "Invalid parameter ~A" token)
+                (handler-case (progn (bl.cfg:check-cli-args (list token)) "accepted")
+                  (bl.cfg:cli-parse-error (e) (princ-to-string e))))
+        "~A is no option" token))
+  (finishes (bl.cfg:check-cli-args '("-dbcache=5" "-" "-bogus" "positional"))
+            "nothing after a bare - is checked")
+  (is (equal '(("dbcache" . "5"))
+             (bl.cfg:parse-cli-args '("-dbcache=5" "-" "-txindex")))
+      "nor applied"))
 
 (test settings-json-unknown-keys-are-reported
   "Core logs one `Ignoring unknown rw_settings value` per unrecognized key and

@@ -7,15 +7,24 @@
 ;;; implemented.
 
 (defun split-option-token (arg)
-  "Split one -key / -key=value / --key=value token. Returns (VALUES raw-key
-value), where VALUE is NIL when the token carried none and RAW-KEY is
-lower-cased and still carries any `no` prefix. NIL raw-key for a bare - or --."
-  (let* ((s (string-left-trim "-" arg))
-         (eq-pos (position #\= s)))
-    (if (zerop (length s))
-        (values nil nil)
-        (values (string-downcase (if eq-pos (subseq s 0 eq-pos) s))
-                (and eq-pos (subseq s (1+ eq-pos)))))))
+  "Split one -key / -key=value / --key=value token as Core's ParseParameters
+does (common/args.cpp:194-228): the value is what follows the first `=', and
+the key loses ONE more leading dash when it starts with two, then one. Returns
+(VALUES raw-key value): RAW-KEY keeps its case and any `no' prefix -- Core
+compares names case-sensitively off WIN32 (:200-204), so -DBCACHE is no
+option -- and is \"\" for a bare `--', which no option is either; VALUE is NIL
+when the token carried none."
+  (let* ((eq-pos (position #\= arg))
+         (key (subseq arg 0 eq-pos))
+         (dashes (if (and (> (length key) 1) (char= (char key 1) #\-)) 2 1)))
+    (values (subseq key (min dashes (length key)))
+            (and eq-pos (subseq arg (1+ eq-pos))))))
+
+(defun cli-option-args (args)
+  "ARGS up to Core's end-of-options marker: a bare `-' ends ParseParameters
+(args.cpp:193, bitcoin-tx's stdin), and nothing after it is read -- neither
+checked nor applied."
+  (subseq args 0 (position "-" args :test #'equal)))
 
 (defun interpret-arg (raw-key value)
   "Core's InterpretKey + InterpretValue for one option (common/args.cpp:76-126).
@@ -77,10 +86,10 @@ bare name: Core refuses such a command line outright (args.cpp:232-237 —
 CHECK-CLI-ARGS is where the refusal lives), so applying it here would let a
 caller that skipped that check run on a setting Core would not have taken."
   (let ((out nil))
-    (dolist (arg args (nreverse out))
+    (dolist (arg (cli-option-args args) (nreverse out))
       (when (and (stringp arg) (plusp (length arg)) (char= (char arg 0) #\-))
         (multiple-value-bind (raw-key value) (split-option-token arg)
-          (when raw-key                            ; NIL for a bare "-" / "--"
+          (when (plusp (length raw-key))           ; a bare "--" names nothing
             ;; One interpreter for the command line AND the config file, so
             ;; Core's InterpretKey/InterpretValue rule has a single home.
             (multiple-value-bind (key string-value json section)
@@ -90,8 +99,8 @@ caller that skipped that check run on a setting Core would not have taken."
 
 (defun parse-cli-args (args)
   "Parse Bitcoin Core-style CLI ARGS (a list of strings) into an alist of
- (lower-case-key . value-string), in order. Accepts -key=value and
---key=value; a bare -key means key=1 and -nokey means key=0 (Core
+ (key . value-string), in order, each key as written (Core folds no case).
+Accepts -key=value and --key=value, and stops at a bare - as Core does; a bare -key means key=1 and -nokey means key=0 (Core
 InterpretKey/InterpretValue). A repeated non-repeatable key keeps only its
 LAST occurrence (see CONFIG-OPTION-REPEATABLE-P), so an assoc lookup
 matches Core's command-line GetArg. Non-flag tokens are ignored here;
@@ -122,7 +131,7 @@ them."
    :test #'string= :from-end t))
 
 (defun known-config-option-p (name)
-  "T if NAME (lower-case, no dashes) is a recognized config option: any
+  "T if NAME (no dashes, case as written) is a recognized config option: any
 DEFINE-OPTION row, including the recognised-but-unimplemented Core options
 (accepted so an ordinary bitcoind command line starts this node, warned
 about at startup so nobody mistakes that for support). check-cli-args uses
@@ -130,10 +139,10 @@ this to reject unknown command-line options at startup, like Core
 ArgsManager::ParseParameters (common/args.cpp:229-238).
 
 Every comparison here is case-SENSITIVE, as Core's GetArgFlags is off WIN32
-(args.cpp:200-204, :258-268), and so is CORE-ONLY-OPTION-P. The parsers hand
-both predicates lower-case names; the settings file is the one source neither
-Core nor we fold, so an unrecognised spelling there earns the same
-`Ignoring unknown configuration value` line it earns in Core."
+(args.cpp:200-204, :258-268), and so is CORE-ONLY-OPTION-P. No source folds
+a name's case -- not the command line, the config file or the settings file,
+in Core or here -- so -DBCACHE is an invalid parameter and `DBCACHE=5' in
+bitcoin.conf earns Core's `Ignoring unknown configuration value' line."
   (and (or (find-config-option name)
            ;; -nokey negation of a known key parses to key=0 before this
            ;; check, but tolerate the raw \"noKEY\" spelling too.
@@ -165,13 +174,11 @@ Signals CLI-PARSE-ERROR, whose report carries Core's prefix. The detail texts
 are Core's own, verbatim, because they are what an operator searches for."
   (flet ((refuse (fmt &rest args)
            (error 'cli-parse-error :detail (apply #'format nil fmt args))))
-    (dolist (arg args args)
+    (dolist (arg (cli-option-args args) args)
       (unless (stringp arg)
         (refuse "Invalid command '~A'" arg))
       (if (and (plusp (length arg)) (char= (char arg 0) #\-))
-          (let* ((s (string-left-trim "-" arg))
-                 (eq-pos (position #\= s))
-                 (name (string-downcase (if eq-pos (subseq s 0 eq-pos) s))))
+          (multiple-value-bind (name value) (split-option-token arg)
             ;; -includeconf is a CONFIG-FILE directive only. Core refuses it on
             ;; the command line outright (common/args.cpp; the text is pinned
             ;; by argsman_tests.cpp:205-206), because honouring it there would
@@ -195,8 +202,7 @@ are Core's own, verbatim, because they are what an operator searches for."
             ;; negative and the valued form, and the bare form is pinned by
             ;; argsman_tests.cpp:205-206.
             (let* ((negated (and (> (length name) 2) (string= "no" (subseq name 0 2))))
-                   (base (if negated (subseq name 2) name))
-                   (value (and eq-pos (subseq s (1+ eq-pos)))))
+                   (base (if negated (subseq name 2) name)))
               (when (string= base "includeconf")
                 (cond
                   ((not negated)
@@ -204,8 +210,7 @@ are Core's own, verbatim, because they are what an operator searches for."
                            (or value "")))
                   ((and value (not (conf-parse-bool value)))
                    (refuse "-includeconf cannot be used from commandline; -includeconf=true")))))
-            (unless (or (zerop (length name))          ; bare "-"/"--"
-                        (known-config-option-p name))
+            (unless (known-config-option-p name)
               (refuse "Invalid parameter ~A" arg)))
           (refuse "Invalid command '~A'" arg)))))
 

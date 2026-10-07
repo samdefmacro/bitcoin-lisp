@@ -137,10 +137,12 @@ option, use ~A=1 instead" line))))
                         ;; negate anything at all.
                         (multiple-value-bind (key value json section)
                             (interpret-arg
+                             ;; The key as written: Core folds no case here
+                             ;; (config.cpp:99-118), so `DBCACHE=5' is an
+                             ;; unknown configuration value, as it is there.
                              (concatenate 'string prefix
-                                          (string-downcase
-                                           (string-trim '(#\Space #\Tab)
-                                                        (subseq line 0 eq-pos))))
+                                          (string-trim '(#\Space #\Tab)
+                                                       (subseq line 0 eq-pos)))
                              (string-trim '(#\Space #\Tab) (subseq line (1+ eq-pos))))
                           (when (and used-hash (search "rpcpassword" key))
                             (config-file-read-error
@@ -225,7 +227,7 @@ are none."
 (defun parse-bitcoin-conf-sections (text &optional network)
   "Parse bitcoin.conf TEXT into (values section-entries global-entries
 section-json global-json). The first two are in-order alists of
- (lower-case-key . value-string); the last two are the same keys paired with
+ (key . value-string), each key as written; the last two are the same keys paired with
 the JSON rendering Core would have stored, for LogArgs.
 
 GLOBAL-ENTRIES are the default section's keys; SECTION-ENTRIES are the keys of
