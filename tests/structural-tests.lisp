@@ -795,7 +795,7 @@ to make on purpose, so the set is pinned."
     ;; and the reason is recorded here rather than in someone's memory.
     ("%create-transaction-internal" . 440)       ; wallet/wallet-spend.lisp
                                                  ; Core CreateTransactionInternal 376
-    ("rpc-sendall" . 289)                        ; wallet/wallet-spend.lisp
+    ("rpc-sendall" . 270)                        ; wallet/wallet-spend.lisp
                                                  ; Core sendall 279
     ("ms-from-script" . 243)                     ; validation/miniscript.lisp
                                                  ; Core DecodeScript 385
@@ -804,8 +804,8 @@ to make on purpose, so the set is pinned."
     ;; net_processing message pump, whose own functions are far longer
     ;; (ProcessMessage 1594, SendMessages 508). There is no Core boundary to
     ;; copy, so a split here would be invented rather than mirrored.
-    ("run-ibd" . 345)                            ; networking/ibd.lisp (+2: keeps node-context peers live, P2c)
-    ("process-received-block" . 290)             ; networking/ibd.lisp (-10:
+    ("run-ibd" . 298)                            ; networking/ibd.lisp (+2: keeps node-context peers live, P2c)
+    ("process-received-block" . 260)             ; networking/ibd.lisp (-10:
                                                  ; the unpersisted-block re-queue
                                                  ; became %requeue-unpersisted-block
                                                  ; when the AcceptBlock body gate
@@ -830,7 +830,7 @@ BLOCK_FAILED_VALID marking its two failure arms had each open-coded became
 The line count is pinned too, so an entry may shrink but not grow.
 See docs/refactoring-plan-2026-08-27.md 6b.")
 
-(defparameter +longish-function-ceiling+ 67
+(defparameter +longish-function-ceiling+ 66
   "How many definitions may exceed +LONGISH-FUNCTION-LINES+ lines. Lower it
 when the count drops; the test says so. Raised 61 -> 63 by P3.2, which turned
 the 1,227-line start-node into named init steps: three of them are 100-170
@@ -899,7 +899,7 @@ found to be the block-deserialization bottleneck (2026-08-22); the plan
 retires them in favour of the byte-reader.")
 
 (defparameter +retiring-serialization-family-baseline+
-  '((:stream-io . 42)
+  '((:stream-io . 40)
     (:compact-size-definitions . 8))
   "Call-site counts, at the start of the cleanup, of the byte-I/O families the
 plan retires (§4 P1). The byte-reader (br-read-*, 70 sites), the byte-buf
