@@ -703,6 +703,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/torcontrol")
                              (:file "fuzz/parse-script")
                              (:file "fuzz/parse-hd-keypath")
+                             (:file "fuzz/message")
                              (:file "fuzz/p2p-headers-presync")
                              (:file "fuzz/connman")
                              (:file "fuzz/p2p-handshake")
