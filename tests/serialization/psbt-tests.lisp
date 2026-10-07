@@ -1087,7 +1087,9 @@ rawtransaction.cpp:1253-1314)."
         (is (equal (bl.crypto:bytes-to-hex xonly)
                    (cdr (assoc "pubkey" d :test #'string=))))
         (is (equal "01020304" (cdr (assoc "master_fingerprint" d :test #'string=))))
-        (is (equal "m/0'" (cdr (assoc "path" d :test #'string=))))
+        ;; WriteHDKeypath with Core's default apostrophe=false
+        ;; (util/bip32.cpp:51-65): hardened is `h' (it was pinned as "m/0'").
+        (is (equal "m/0h" (cdr (assoc "path" d :test #'string=))))
         (is (equal (bl.crypto:bytes-to-hex leaf-hash)
                    (elt (cdr (assoc "leaf_hashes" d :test #'string=)) 0)))))))
 

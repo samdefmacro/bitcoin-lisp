@@ -113,7 +113,7 @@ arguments (init.cpp:1642-1648)."
                 (bl.net:*current-port* bl.net:*current-port*)
                 (bl.net:*dns-seeds* bl.net:*dns-seeds*)
                 (bl::*random-state-seed* nil)
-                (bl::*eviction-netgroup-key* nil)
+                (bl:*eviction-netgroup-key* nil)
                 (would-have (%entropy-draws 8 (sb-ext:seed-random-state 424242)))
                 (*random-state* (sb-ext:seed-random-state 424242))
                 (node (bl::init-node dir :network :regtest)))
@@ -122,9 +122,9 @@ arguments (init.cpp:1642-1648)."
                     "init-node left *random-state-seed* ~S: it never seeded the RNG"
                     bl::*random-state-seed*)
            (is (not (equal would-have (%entropy-draws 8))))
-           (is-true (consp bl::*eviction-netgroup-key*)
+           (is-true (consp bl:*eviction-netgroup-key*)
                     "init-node left the eviction netgroup key ~S: it never drew one"
-                    bl::*eviction-netgroup-key*))
+                    bl:*eviction-netgroup-key*))
       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
 (test seeded-random-state-reaches-worker-threads

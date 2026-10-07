@@ -539,87 +539,92 @@ signature over HASH32 with the given RECID (0-3). Returns the pubkey bytes
 
 ;;; Lax DER signature parsing
 ;;;
-;;; Bitcoin's pre-DERSIG signatures could have various encoding issues:
-;;; - Extra padding bytes in R or S
-;;; - Missing leading zeros for negative numbers
-;;; - Wrong length indicators
-;;;
-;;; This lax parser extracts R and S values tolerantly and re-encodes them.
+;;; Core verifies every ECDSA signature through ecdsa_signature_parse_der_lax
+;;; (pubkey.cpp:45-176), the tolerant parser that predates BIP66: it reads
+;;; R and S out of anything shaped like a DER SEQUENCE of two INTEGERs --
+;;; long-form lengths, any number of leading zero bytes, a sequence length
+;;; that is wrong, trailing bytes -- and an integer with more than 32
+;;; significant bytes is not truncated but OVERFLOWS, which leaves the
+;;; correctly-parsed but invalid all-zero signature. Under DERSIG the
+;;; interpreter checks strict encoding first, so this decides only pre-BIP66
+;;; signatures; there it is consensus.
 
-(defun parse-der-integer-lax (bytes pos)
-  "Parse an integer from DER-ish encoding, starting at POS.
-   Returns (values integer new-pos) or (values nil nil) on error.
-   Tolerates extra padding and missing sign bytes."
-  (when (>= pos (length bytes))
-    (return-from parse-der-integer-lax (values nil nil)))
-  ;; Expect 0x02 (INTEGER tag)
-  (unless (= (aref bytes pos) #x02)
-    (return-from parse-der-integer-lax (values nil nil)))
-  (incf pos)
-  (when (>= pos (length bytes))
-    (return-from parse-der-integer-lax (values nil nil)))
-  ;; Get length
-  (let ((len (aref bytes pos)))
+(defun %lax-der-integer (input pos)
+  "One INTEGER of Core's lax parser at POS of INPUT (pubkey.cpp:74-111 for R,
+:113-148 for S): the 0x02 tag, then a length -- short form, or long form
+whose length bytes may start with zeros and must leave fewer than four --
+that fits in the rest of INPUT. (VALUES start length) of the integer's bytes,
+or NIL when it does not parse."
+  (let ((inputlen (length input)))
+    (when (or (= pos inputlen) (/= (aref input pos) #x02))
+      (return-from %lax-der-integer nil))
     (incf pos)
-    (when (or (zerop len) (> (+ pos len) (length bytes)))
-      (return-from parse-der-integer-lax (values nil nil)))
-    ;; Extract bytes, stripping leading zeros (but keep at least 1 byte)
-    (let ((start pos)
-          (end (+ pos len)))
-      ;; Skip leading zeros (except the last byte)
-      (loop while (and (< start (1- end))
-                       (zerop (aref bytes start))
-                       ;; But keep a zero if next byte has high bit set
-                       (zerop (logand (aref bytes (1+ start)) #x80)))
-            do (incf start))
-      ;; Convert to integer
-      (let ((result 0))
-        (loop for i from start below end
-              do (setf result (logior (ash result 8) (aref bytes i))))
-        (values result end)))))
-
-(defun integer-to-bytes-be (n byte-count)
-  "Convert integer N to big-endian byte array of BYTE-COUNT bytes."
-  (let ((result (make-array byte-count :element-type '(unsigned-byte 8) :initial-element 0)))
-    (loop for i from (1- byte-count) downto 0
-          for shift from 0 by 8
-          do (setf (aref result i) (logand (ash n (- shift)) #xff)))
-    result))
+    (when (= pos inputlen)
+      (return-from %lax-der-integer nil))
+    (let ((lenbyte (aref input pos))
+          (len 0))
+      (incf pos)
+      (cond ((logtest lenbyte #x80)
+             (decf lenbyte #x80)
+             (when (> lenbyte (- inputlen pos))
+               (return-from %lax-der-integer nil))
+             (loop while (and (plusp lenbyte) (zerop (aref input pos)))
+                   do (incf pos) (decf lenbyte))
+             (when (>= lenbyte 4)
+               (return-from %lax-der-integer nil))
+             (loop while (plusp lenbyte)
+                   do (setf len (+ (ash len 8) (aref input pos)))
+                      (incf pos) (decf lenbyte)))
+            (t (setf len lenbyte)))
+      (when (> len (- inputlen pos))
+        (return-from %lax-der-integer nil))
+      (values pos len))))
 
 (defun normalize-signature-lax (der-sig)
-  "Parse a lax DER signature and return a 64-byte compact signature (r||s).
-   Returns NIL if parsing fails."
-  (when (< (length der-sig) 8)
-    (return-from normalize-signature-lax nil))
-  ;; Expect SEQUENCE tag
-  (unless (= (aref der-sig 0) #x30)
-    (return-from normalize-signature-lax nil))
-  ;; Get sequence length (may not match actual content in lax mode)
-  (let ((pos 2))  ; Skip tag and length
-    ;; Handle extended length encoding
-    (when (> (aref der-sig 1) #x80)
-      (let ((len-bytes (logand (aref der-sig 1) #x7f)))
-        (setf pos (+ 2 len-bytes))))
-    ;; Parse R
-    (multiple-value-bind (r new-pos)
-        (parse-der-integer-lax der-sig pos)
-      (unless r
-        (return-from normalize-signature-lax nil))
-      ;; Parse S
-      (multiple-value-bind (s final-pos)
-          (parse-der-integer-lax der-sig new-pos)
-        (declare (ignore final-pos))
-        (unless s
+  "Core ecdsa_signature_parse_der_lax (pubkey.cpp:45-176): the 64-byte compact
+signature (r||s) DER-SIG encodes, or NIL when it does not parse.
+
+What parses: a 0x30 tag; a sequence length, short or long form, whose value
+is ignored; an INTEGER R and an INTEGER S as %LAX-DER-INTEGER reads them;
+anything after S. Leading zero bytes of R and S are dropped; an integer of
+more than 32 bytes after that OVERFLOWS and the answer is the all-zero
+signature, which parses and never verifies -- Core's \"correctly-parsed but
+invalid signature\". An R or S at or above the group order is returned as it
+is and refused by secp256k1_ecdsa_signature_parse_compact, the same function
+Core's parser hands it to (:174), so every caller treats it as that invalid
+signature too."
+  (let ((inputlen (length der-sig))
+        (pos 0))
+    (when (or (= pos inputlen) (/= (aref der-sig pos) #x30))
+      (return-from normalize-signature-lax nil))
+    (incf pos)
+    (when (= pos inputlen)
+      (return-from normalize-signature-lax nil))
+    (let ((lenbyte (aref der-sig pos)))
+      (incf pos)
+      (when (logtest lenbyte #x80)
+        (decf lenbyte #x80)
+        (when (> lenbyte (- inputlen pos))
           (return-from normalize-signature-lax nil))
-        ;; Convert R and S to 32-byte big-endian
-        (let ((r-bytes (integer-to-bytes-be r 32))
-              (s-bytes (integer-to-bytes-be s 32)))
-          ;; Concatenate for 64-byte compact format
-          (let ((result (make-array 64 :element-type '(unsigned-byte 8))))
-            (loop for i from 0 below 32
-                  do (setf (aref result i) (aref r-bytes i))
-                  do (setf (aref result (+ i 32)) (aref s-bytes i)))
-            result))))))
+        (incf pos lenbyte)))
+    (multiple-value-bind (rpos rlen) (%lax-der-integer der-sig pos)
+      (unless rpos
+        (return-from normalize-signature-lax nil))
+      (multiple-value-bind (spos slen) (%lax-der-integer der-sig (+ rpos rlen))
+        (unless spos
+          (return-from normalize-signature-lax nil))
+        (let ((compact (make-array 64 :element-type '(unsigned-byte 8) :initial-element 0)))
+          (flet ((copy (start len offset)
+                   ;; Leading zeroes are ignored; more than 32 bytes is overflow.
+                   (loop while (and (plusp len) (zerop (aref der-sig start)))
+                         do (incf start) (decf len))
+                   (when (> len 32)
+                     (return-from normalize-signature-lax (fill compact 0)))
+                   (replace compact der-sig :start1 (- (+ offset 32) len)
+                                            :start2 start :end2 (+ start len))))
+            (copy rpos rlen 0)
+            (copy spos slen 32))
+          compact)))))
 
 ;;; Compact signature parsing (for secp256k1)
 

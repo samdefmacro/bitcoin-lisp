@@ -217,3 +217,166 @@ sixteen bytes are our network's VERSION header."
                           (and (>= (length bytes) 16) (equalp (subseq bytes 0 16) v1-prefix)))
                       "the sniff answered ~S for a first sixteen bytes of ~A" result
                       (bl.crypto:bytes-to-hex (subseq bytes 0 (min 16 (length bytes))))))))))
+
+;;; --- p2p_transport_bidirectional and _v1v2: SimulationTest --------------------------
+;;;
+;;; Core's SimulationTest (p2p_transport_serialization.cpp:107-337) drives two
+;;; Transport objects with fragmented, interleaved sends and receives and
+;;; asserts that every message arrives, in order and intact. Ours has no
+;;; Transport object to hand bytes to: a side SENDS by writing a fuzz-chosen
+;;; prefix of its framed bytes onto a loopback socket (SEND-BYTES), and
+;;; RECEIVES by asking RECEIVE-MESSAGE once, which takes whatever the kernel
+;;; has delivered -- so a message may be split at any byte, and a receive may
+;;; find half a header, as Core's fragmentation produces. Core's
+;;; GetBytesToSend consistency checks are about its Transport API and have no
+;;; counterpart; its receive-side assertions all port.
+
+(defun %fuzz-sim-message-type (fdp)
+  "SimulationTest's msg_type_fn (:135-153): a u8; 0xFF builds a valid type of
+up to twelve printable characters from the buffer, anything else indexes
+Core's ALL_NET_MESSAGE_TYPES."
+  (let ((v (consume-integral fdp :u8)))
+    (if (= v #xff)
+        (with-output-to-string (s)
+          (loop repeat 12
+                for c = (consume-integral fdp :i8)
+                while (<= 32 c 126)
+                do (write-char (code-char c) s)))
+        (nth (mod v (length +fuzz-net-message-types+)) +fuzz-net-message-types+))))
+
+(defun %fuzz-sim-make-message (fdp rng first)
+  "SimulationTest's make_msg_fn (:156-169): a VERSION first, then any type;
+up to 75 kB of payload from the RNG."
+  (cons (if first "version" (%fuzz-sim-message-type fdp))
+        (insecure-rand-bytes rng (consume-integral-in-range fdp 0 75000 32))))
+
+(defun %fuzz-sim-receive (ends side expected)
+  "recv_fn (:244-292) for the bytes SIDE sent: one RECEIVE-MESSAGE on the
+other end. A delivered message must be the front of SIDE's queue in the
+vector EXPECTED; returns T when a message was delivered."
+  (multiple-value-bind (command payload) (bl.net:receive-message (aref ends (- 1 side)) :timeout 1)
+    (cond (command
+           (let ((want (pop (aref expected side))))
+             (fuzz-assert want "side ~D received ~S that side ~D never sent" (- 1 side) command side)
+             (fuzz-assert (and (equal command (car want))
+                               (equalp (fuzz-sabotage (coerce payload '(vector (unsigned-byte 8))))
+                                       (cdr want)))
+                          "side ~D received ~S (~D bytes) where ~S (~D bytes) was sent"
+                          (- 1 side) command (length payload) (car want) (length (cdr want))))
+           t)
+          (t (fuzz-assert (eq payload :incomplete)
+                          "side ~D's reader failed on bytes side ~D sent intact" (- 1 side) side)
+             nil))))
+
+(defun %fuzz-transport-simulation (fdp rng ends &key (ready-p (lambda (side) (declare (ignore side)) t)))
+  "SimulationTest (:107-337) over the two peers ENDS (index 0 the initiator).
+READY-P says whether a side's transport takes messages yet (a v2 responder
+still sniffing for v1 takes none, as V2Transport::SetMessageToSend refuses
+before READY) and whether its reader may run. Returns how many bytes each side
+put on the wire, as a two-element vector."
+  (let ((sent (vector 0 0))
+        (pending (vector (make-array 0 :element-type '(unsigned-byte 8))
+                         (make-array 0 :element-type '(unsigned-byte 8))))
+        (expected (vector '() '()))
+        (next (vector (%fuzz-sim-make-message fdp rng t) (%fuzz-sim-make-message fdp rng t))))
+    (labels ((conn (side) (bl.net:peer-connection (aref ends side)))
+             (new-msg (side)
+               ;; new_msg_fn (:206-224): a transport takes the next message
+               ;; only once the previous one is wholly on the wire (V1Transport
+               ;; ::SetMessageToSend), and never with 16 unreceived.
+               (when (and (funcall ready-p side)
+                          (< (length (aref expected side)) 16)
+                          (zerop (length (aref pending side))))
+                 (let ((m (aref next side)))
+                   (setf (aref pending side) (bl.ser:serialize-message (car m) (cdr m)))
+                   (setf (aref expected side) (append (aref expected side) (list m)))
+                   (setf (aref next side) (%fuzz-sim-make-message fdp rng nil)))))
+             (send (side everything)
+               ;; send_fn (:227-241): a prefix of what is to be sent.
+               (let* ((bytes (aref pending side))
+                      (n (if everything (length bytes) (consume-integral-in-range fdp 0 (length bytes)))))
+                 (when (plusp n)
+                   (fuzz-assert (bl.net:send-bytes (conn side) (subseq bytes 0 n))
+                                "side ~D could not send" side)
+                   (%v2t-drain (conn side) :seconds 2)
+                   (setf (aref pending side) (subseq bytes n))
+                   (incf (aref sent side) n)
+                   t)))
+             (recv (side)
+               (and (funcall ready-p (- 1 side))
+                    (%fuzz-sim-receive ends side expected))))
+      (limited-while ((plusp (remaining-bytes fdp)) 1000)
+        (call-one-of fdp
+          (new-msg 0) (new-msg 1)
+          (send 0 nil) (send 1 nil)
+          (recv 0) (recv 1)))
+      ;; Flush (:308-316): send everything, receive until both queues are
+      ;; empty. The kernel delivers when it delivers, so this waits -- up to
+      ;; a deadline that only a lost message reaches.
+      (loop with deadline = (+ (get-internal-real-time) (* 20 internal-time-units-per-second))
+            until (and (null (aref expected 0)) (null (aref expected 1))
+                       (zerop (length (aref pending 0))) (zerop (length (aref pending 1))))
+            do (dotimes (side 2)
+                 (when (funcall ready-p side) (send side t))
+                 (loop while (recv side)))
+               (when (> (get-internal-real-time) deadline) (return))
+               (sleep 0.001))
+      ;; :319-325: nothing left in flight, every message received.
+      (fuzz-assert (and (null (aref expected 0)) (null (aref expected 1)))
+                   "messages never arrived: ~D from side 0, ~D from side 1"
+                   (length (aref expected 0)) (length (aref expected 1))))
+    sent))
+
+(defun %fuzz-v1-ends (client server)
+  "Two v1 peers over the loopback pair's connections."
+  (vector (bl.net:make-peer :connection client :state :ready :address "127.0.0.1")
+          (bl.net:make-peer :connection server :state :ready :address "127.0.0.1")))
+
+(define-fuzz-target p2p-transport-bidirectional
+    (buffer :core "p2p_transport_serialization.cpp:375-384 (SimulationTest :107-337)"
+            :iterations 30 :max-len 1500)
+  "Two v1 transports exchange messages of any type and up to 75 kB, the
+bytes of each written in fragments of any size interleaved with reads on
+both ends: every message arrives, in order, with its type and payload
+intact, and nothing is left in flight."
+  (let ((fdp (make-fuzzed-data-provider buffer)))
+    (%with-loopback-pair (client server)
+      (%fuzz-transport-simulation fdp (make-insecure-random-context (consume-integral fdp :u64))
+                                  (%fuzz-v1-ends client server)))))
+
+(define-fuzz-target p2p-transport-bidirectional-v1v2
+    (buffer :core "p2p_transport_serialization.cpp:397-406 (SimulationTest :107-337)"
+            :iterations 30 :max-len 1500)
+  "A v1 initiator talks to a responder that offers v2: the responder sniffs
+the VERSION header out of whatever fragments arrive, falls back to v1, and
+from then on every message either side sends arrives in order and intact."
+  (let* ((fdp (make-fuzzed-data-provider buffer))
+         (rng (make-insecure-random-context (consume-integral fdp :u64))))
+    ;; MakeV2Transport's key, garbage length and entropy (:345-372): ours
+    ;; draws its own, so the buffer's bytes are consumed and set aside.
+    (consume-bytes fdp 32)
+    (consume-integral-in-range fdp 0 4095)
+    (consume-bytes fdp 32)
+    (%with-loopback-pair (client server)
+      (let* ((detected (list :pending))
+             (sniffer (bt:make-thread
+                       (lambda ()
+                         (setf (car detected)
+                               (handler-case (%v2t-detect server :timeout 25)
+                                 (error (e) e))))
+                       :name "fuzz-v1v2-responder"))
+             (ends (%fuzz-v1-ends client server))
+             (sent (vector 0 0)))
+        (unwind-protect
+             (setf sent (%fuzz-transport-simulation
+                         fdp rng ends
+                         :ready-p (lambda (side)
+                                    (or (zerop side) (not (eq (car detected) :pending))))))
+          ;; An initiator that never sent its VERSION header leaves Core's
+          ;; responder in MAYBE_V1; ours is waiting on the socket, so hang up.
+          (when (< (aref sent 0) 16)
+            (bl.net:close-connection client))
+          (sb-thread:join-thread sniffer :default nil :timeout 30))
+        (fuzz-assert (eq (eq (fuzz-sabotage (car detected)) :v1) (>= (aref sent 0) 16))
+                     "the responder answered ~S after ~D bytes of a v1 VERSION"
+                     (car detected) (aref sent 0))))))

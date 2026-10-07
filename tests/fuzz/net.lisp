@@ -208,3 +208,189 @@ network."
               (bl.net:remove-local network bytes)
               (bl.net:seen-local network bytes)
               (bl.net:best-local-address (pick-value-in-array fdp '(:ipv4 :ipv6 :torv3 :i2p :cjdns))))))))))
+
+;;; --- net.cpp: net ---------------------------------------------------------------
+;;;
+;;; Core's target builds a CNode from the buffer and calls its operations in
+;;; any order: CloseSocketDisconnect, CopyStats, AddRef/Release,
+;;; ReceiveMsgBytes, then the getters. Ours is a PEER over one end of a
+;;; loopback pair. ReceiveMsgBytes is bytes written into the other end and
+;;; read off with RECEIVE-MESSAGE; CopyStats is the peer's getpeerinfo row;
+;;; CloseSocketDisconnect is DISCONNECT-PEER. AddRef/Release have no
+;;; counterpart (a peer is collected, not counted) and stay as choices that do
+;;; nothing, so the buffer's other draws keep Core's shape; so does
+;;; SetCommonVersion, which ours derives from the VERSION message.
+;;;
+;;; Core asserts AddRef returns the node and the reference count stays
+;;; non-negative. Ours asserts what the operations are FOR: the messages
+;;; delivered are Core's V1Transport reading of every byte fed so far
+;;; (%V1-REFERENCE-MESSAGES), a connection Core would drop is dropped; the
+;;; stats row names the peer, its type and direction, the network it is
+;;; connected through, and the local address it reported exactly when that
+;;; address is valid; and with no whitelist the peer holds no permission.
+
+(defparameter +fuzz-net-conn-types+
+  '(:inbound :outbound-full-relay :manual :feeler :block-relay :addr-fetch)
+  "Core ALL_CONNECTION_TYPES (node/connection_types.h), as peer conn-types.")
+
+(defun %fuzz-net-node-peer (fdp connection)
+  "Core ConsumeNode (test/fuzz/util/net.h:270-309) as a PEER on CONNECTION.
+Returns the peer and, second, the network of the address it was given."
+  (multiple-value-bind (network bytes) (consume-net-addr fdp)
+    (let* ((id (consume-integral-in-range fdp 0 (1- (ash 1 63))))
+           (port (consume-integral fdp :u16))
+           (address (bl.net:network-address-to-string network bytes)))
+      (consume-integral fdp :u64)            ; keyed net group: derived from the address
+      (let ((nonce (consume-integral fdp :u64)))
+        (consume-net-addr fdp)                ; addr_bind: the socket's own
+        (consume-random-length-string fdp 64) ; addr_name: the address string here
+        (let* ((conn-type (pick-value-in-array fdp +fuzz-net-conn-types+))
+               (inbound (eq conn-type :inbound))
+               (onion (and inbound (consume-bool fdp))))
+          (consume-integral fdp :u64)         ; network key
+          (consume-integral fdp :u32)         ; permission flags: ours derive from the whitelist
+          (values (bl.net:make-peer :id id :connection connection :state :ready
+                                    :address address :remote-port port :local-nonce nonce
+                                    :conn-type conn-type :inbound inbound :inbound-onion onion)
+                  network))))))
+
+(defun %fuzz-net-type-string (field)
+  "The 12-byte type FIELD as RECEIVE-MESSAGE names it: trailing NULs dropped."
+  (map 'string #'code-char (subseq field 0 (1+ (or (position 0 field :test-not #'eql :from-end t) -1)))))
+
+(defparameter +fuzz-net-network-names+
+  '((:ipv4 . "ipv4") (:ipv6 . "ipv6") (:torv3 . "onion") (:i2p . "i2p") (:cjdns . "cjdns")
+    (:unroutable . "not_publicly_routable"))
+  "Core GetNetworkName (netbase.cpp:111-127).")
+
+(defun %fuzz-net-receive-bytes (peer writer bytes fed delivered)
+  "CNode::ReceiveMsgBytes (net.cpp:653-697): BYTES into PEER through the
+WRITER end, read until the reader has taken every byte FED (an adjustable
+vector BYTES are appended to) or the peer is gone; messages are pushed onto
+the cell DELIVERED."
+  (let ((conn (bl.net:peer-connection peer)))
+    (when (and (plusp (length bytes)) (bl.net:send-bytes writer bytes))
+      (%v2t-drain writer :seconds 2)
+      (loop for b across bytes do (vector-push-extend b fed))
+      (loop with deadline = (+ (get-internal-real-time) (* 5 internal-time-units-per-second))
+            do (multiple-value-bind (command payload) (bl.net:receive-message peer :timeout 1)
+                 (cond (command (push (cons command (coerce payload '(vector (unsigned-byte 8))))
+                                      (car delivered)))
+                       ((eq (bl.net:peer-state peer) :disconnected) (return))
+                       ((and (eq payload :incomplete)
+                             (>= (bl.net:connection-bytes-received conn) (length fed)))
+                        (return))
+                       ((> (get-internal-real-time) deadline) (return))
+                       ((eq payload :incomplete) (sleep 0.0005))))))))
+
+(defun %fuzz-net-check-received (peer fed delivered)
+  "What PEER delivered is Core's reading of FED, and a connection Core drops
+is dropped."
+  (multiple-value-bind (want end) (%v1-reference-messages fed bl.ser:*network-magic*)
+    (let ((got (reverse (car delivered))))
+      (fuzz-assert (= (length (fuzz-sabotage got)) (length want))
+                   "~D messages delivered where Core delivers ~D (~A)" (length got) (length want) end)
+      (loop for (command . payload) in got
+            for (field . want-payload) in want
+            do (fuzz-assert (and (string= command (%fuzz-net-type-string field)) (equalp payload want-payload))
+                            "delivered ~S where Core delivers ~S" command (%fuzz-net-type-string field)))
+      (when (eq end :disconnect)
+        (fuzz-assert (eq (bl.net:peer-state peer) :disconnected)
+                     "Core drops this connection; ours is ~S" (bl.net:peer-state peer))))))
+
+(defun %fuzz-net-check-stats (node peer addr-local)
+  "CNode::CopyStats (net.cpp:607-661) through getpeerinfo: one row while the
+peer is connected and none after (getpeerinfo walks Core's m_nodes, which a
+closed node leaves), naming the peer as it is. ADDR-LOCAL is the
+(network bytes port) the peer reported, or NIL."
+  (let ((rows (yason:parse (rpc-result-json (bl.rpc:dispatch-rpc-method node "getpeerinfo" nil)))))
+    (if (eq (bl.net:peer-state peer) :disconnected)
+        (fuzz-assert (null rows) "a closed peer is still in getpeerinfo")
+        (let* ((row (first rows))
+               (field (lambda (name) (gethash name row))))
+          (fuzz-assert (and (= (length rows) 1) (eql (funcall field "id") (fuzz-sabotage (bl.net:peer-id peer))))
+                       "getpeerinfo answered ~D rows for peer ~D" (length rows) (bl.net:peer-id peer))
+          (fuzz-assert (equal (funcall field "connection_type")
+                              (bl.net:connection-type-string (bl.net:peer-conn-type peer)))
+                       "connection_type ~S for ~S" (funcall field "connection_type") (bl.net:peer-conn-type peer))
+          (fuzz-assert (eq (funcall field "inbound") (bl.net:peer-inbound peer)))
+          (fuzz-assert (equal (funcall field "network")
+                              (cdr (assoc (bl.net:peer-connected-through-network peer) +fuzz-net-network-names+)))
+                       "getpeerinfo says ~S for a peer connected through ~S"
+                       (funcall field "network") (bl.net:peer-connected-through-network peer))
+          (destructuring-bind (&optional network bytes port) addr-local
+            (let ((valid (and network (bl.net:address-valid-p bytes network)))
+                  (shown (funcall field "addrlocal")))
+              (fuzz-assert (eq (and shown t) (and valid t))
+                           "addrlocal ~S for a reported ~A address that is ~:[not ~;~]valid"
+                           shown network valid)
+              (when shown
+                (let* ((colon (position #\: shown :from-end t))
+                       (host (string-trim "[]" (subseq shown 0 colon))))
+                  (multiple-value-bind (parsed-network parsed) (bl.net:parse-network-address host)
+                    (declare (ignore parsed-network))
+                    (fuzz-assert (and (equalp parsed bytes)
+                                      (= (parse-integer shown :start (1+ colon)) port))
+                                 "addrlocal ~S does not name ~A port ~D"
+                                 shown (bl.net:network-address-to-string network bytes) port))))))))))
+
+(define-fuzz-target net
+    (buffer :core "net.cpp:31-74 (net)" :iterations 150 :max-len 800)
+  "A peer under any sequence of disconnects, stats reads and received bytes:
+it delivers exactly the messages Core's transport reads out of the bytes and
+drops the connection where Core does; its stats name it, its connection type,
+the network it came through and the local address it reported when that is
+valid; it holds no permission no whitelist granted."
+  (let* ((fdp (make-fuzzed-data-provider buffer))
+         (bl.ser:*mock-time* (consume-integral-in-range fdp 1 4102444800))
+         (bl.net:*whitelist-entries* '())
+         (bl.net:*whitebind-flags* 0)
+         (node (make-test-node)))
+    (%with-loopback-pair (writer reader)
+      (let* ((peer (%fuzz-net-node-peer fdp reader))
+             (addr-local nil)
+             (fed (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+             (delivered (list '())))
+        (setf (bl:node-peers node) (list peer))
+        (consume-integral fdp :i32)           ; SetCommonVersion
+        (when (consume-bool fdp)              ; SetAddrLocal: a V1 CService
+          (multiple-value-bind (network bytes) (consume-net-addr fdp)
+            (declare (ignore network))
+            ;; A V1 address is sixteen bytes and its network is what the bytes
+            ;; say (CNetAddr::V1 unserialization): a CJDNS address is IPv6 here.
+            (when (= (length bytes) 16)
+              (setf addr-local (list (bl.net:ip-network bytes) bytes (consume-integral fdp :u16)))
+              ;; As the VERSION handler stores it: the message read off the wire.
+              (setf (bl.net:peer-version peer)
+                    (bl.bytes:with-byte-reader
+                        (in (bl.ser:make-version-message-bytes
+                             :addr-recv (bl.ser:make-net-addr :ip bytes :port (third addr-local))))
+                      (bl.ser:read-version-message in))))))
+        (limited-while ((%fuzz-continue-p fdp) 10000)
+          (call-one-of fdp
+            (bl.net:disconnect-peer peer)
+            (%fuzz-net-check-stats node peer addr-local)
+            nil                               ; AddRef
+            nil                               ; Release
+            (unless (eq (bl.net:peer-state peer) :disconnected)
+              (%fuzz-net-receive-bytes
+               peer writer
+               (if (consume-bool fdp)
+                   (consume-random-length-byte-vector fdp)
+                   (bl.ser:serialize-message (pick-value-in-array fdp +fuzz-net-message-types+)
+                                             (consume-random-length-byte-vector fdp)))
+               fed delivered)
+              (%fuzz-net-check-received peer fed delivered))))
+        (%fuzz-net-check-stats node peer addr-local)
+        (bl.net:peer-addr-local peer)
+        (fuzz-assert (eq (bl.net:peer-connected-through-network peer)
+                         (if (bl.net:peer-inbound-onion peer)
+                             :torv3
+                             (multiple-value-bind (network bytes)
+                                 (bl.net:parse-network-address (bl.net:peer-address peer))
+                               (bl.net:address-net-class network bytes))))
+                     "~A is connected through ~S, Core's GetNetClass says otherwise"
+                     (bl.net:peer-address peer) (bl.net:peer-connected-through-network peer))
+        (let ((flag (pick-value-in-array fdp (list 0 1 2 4 8 16 32 64 (consume-integral fdp :u32)))))
+          (fuzz-assert (eq (bl.net:peer-has-permission-p peer flag) (zerop flag))
+                       "with no whitelist the peer holds permission ~D" flag))))))

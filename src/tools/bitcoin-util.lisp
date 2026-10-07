@@ -61,9 +61,13 @@ task's own copy of the 80 bytes."
              1)))
 
 (defun %hex-p (text)
-  "Core IsHex: non-empty, even length, hex digits only."
+  "Core IsHex (util/strencodings.cpp:41-47): non-empty, even length, and
+every character one of Core's HexDigit table -- ASCII 0-9, a-f, A-F. Not
+DIGIT-CHAR-P, which in SBCL also answers for every Unicode decimal digit, so
+`0x' followed by two Arabic-Indic digits was raw script bytes where Core reads
+an unknown opcode."
   (and (plusp (length text)) (evenp (length text))
-       (every (lambda (c) (digit-char-p c 16)) text)))
+       (every (lambda (c) (find c "0123456789abcdefABCDEF")) text)))
 
 (defun %grind (args)
   "Core Grind (bitcoin-util.cpp:112-150): (values exit-code text)."

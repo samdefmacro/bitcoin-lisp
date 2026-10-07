@@ -486,24 +486,27 @@ Pins the netgroup key: a real node draws it from the OS CSPRNG in INIT-NODE
 and %EVICT-KEYED-NETGROUP signals without it, so a fixture that only calls
 MAKE-NODE has to supply one -- and a FIXED one, or which netgroup the pass
 protects would vary from run to run."
-  (let ((bl::*eviction-netgroup-key* (cons 1 2)))
-    (bl::evict-least-valuable-inbound node)))
+  (let ((bl:*eviction-netgroup-key* (cons 1 2)))
+    (bl:evict-least-valuable-inbound node)))
 
 (defun %evict-peer (addr &key (ping 1000) (connect-time 5000)
                               (min-ping nil) (tx-time 0) (block-time 0)
                               (relay t))
   "An inbound peer for the eviction tests. MIN-PING defaults to PING, since
-Core protects on the MINIMUM and that is what the selector reads."
+Core protects on the MINIMUM and that is what the selector reads. The peer
+has sent its VERSION, offering NODE_NETWORK|NODE_WITNESS and asking for
+transactions unless RELAY is NIL -- the fRelay=0 inbound peer, which is what
+another node's block-relay-only connection looks like from our side."
   (let ((p (bl.net:make-peer
             :address addr :inbound t :state :ready
             :ping-latency ping :connect-time connect-time)))
     (setf (bl.net:peer-min-ping-latency p) (or min-ping ping)
           (bl.net:peer-last-tx-time p) tx-time
-          (bl.net:peer-last-block-time p) block-time)
-    ;; peer-relays-txs-p is derived from the conn type; :block-relay is the
-    ;; shape Core's non-tx-relay pass filters on.
-    (unless relay
-      (setf (bl.net:peer-conn-type p) :block-relay))
+          (bl.net:peer-last-block-time p) block-time
+          (bl.net:peer-services p) (logior bl.ser:+node-network+ bl.ser:+node-witness+)
+          (bl.net:peer-version p) (bl.bytes:with-byte-reader
+                                      (in (bl.ser:make-version-message-bytes :relay relay))
+                                    (bl.ser:read-version-message in)))
     p))
 
 (defun %evict-filler (n &key (first-octet 10))
@@ -583,12 +586,22 @@ peer the operator explicitly trusted was as evictable as any other."
   "Core protects up to 8 NON-tx-relay peers that have given us novel blocks
 (eviction.cpp:195-197), a pass this node did not have. Without it a
 block-relay-only peer doing exactly the job it exists for was no safer than an
-idle one — and block-relay-only links are the anti-partition insurance."
+idle one — and block-relay-only links are the anti-partition insurance.
+
+Core's m_relay_txs is whether the PEER asked for transactions, at VERSION
+(net_processing.cpp:3695). Ours read our own side of the connection, which
+for an inbound peer always relays, so the pass protected no inbound peer at
+all; the test built an inbound peer with an outbound connection type, and
+gave it the newest block of all, so the ordinary block pass protected it
+whatever the block-relay-only pass did. Now the peer is a real one --
+inbound, fRelay=0 -- with a block in the middle of the field, which only the
+block-relay-only pass protects (found by the node_eviction fuzz target)."
   (let* ((node (bl:make-node))
-         ;; Worst on every OTHER measure, but a block-relay-only peer that has
-         ;; delivered a block.
+         ;; Worst on every OTHER measure, including the plain block pass (20
+         ;; filler peers delivered later blocks), but a block-relay-only peer
+         ;; that has delivered a block.
          (br (%evict-peer "10.0.9.9" :ping 99999 :connect-time 9999999
-                                     :block-time 999999 :relay nil))
+                                     :block-time 300020 :relay nil))
          (filler (%evict-filler 40)))
     (setf (bl:node-peers node) (cons br filler))
     (%evict-one node)
@@ -656,10 +669,12 @@ onion peers and there are twice as many as slots, which is what makes the
 direction observable. The reserve tests above assert only that SOME onion peer
 survives, so they pass either way.
 
-Hand-evaluating Core on this input: only onion has a non-zero count, so
-protect_per_network = 4; its members sort DESCENDING by m_connected, so the
-last four are 10..13, the long-lived ones. The general uptime half then
-protects clearnet 1..4, leaving exactly the list below."
+Hand-evaluating Core on this input: the onion peers arrive from 127.0.0.1, so
+they count under localhost (m_is_local) as well as onion -- two networks of 8,
+protect_per_network = 2. Each pass sorts its members DESCENDING by
+m_connected, so localhost protects 10 and 11 and onion 12 and 13, the
+long-lived ones. The general uptime half then protects clearnet 1..4, leaving
+exactly the set below (in Core's vector order, newest first)."
   (flet ((onion (connect-time)
            (let ((p (%evict-peer "127.0.0.1" :connect-time connect-time)))
              (setf (bl.net:peer-inbound-onion p) t)
@@ -671,7 +686,7 @@ protects clearnet 1..4, leaving exactly the list below."
            (fresh (loop for i from 20 to 23 collect (onion i)))
            (evictable (%evict-ratio-survivors
                        (append clearnet long-lived fresh))))
-      (is (equal '(5 6 7 8 20 21 22 23) evictable)
+      (is (equal '(5 6 7 8 20 21 22 23) (sort (copy-list evictable) #'<))
           "the reserve must protect the LONGEST-connected onion peers (10-13) ~
 and leave the freshest (20-23) evictable; got ~S" evictable))))
 
@@ -708,9 +723,9 @@ first value of SBCL's build-time stream and every node drew the SAME one.
 Replaying one *random-state* here is exactly that: two processes running the
 same build. The keys must still differ."
   (let ((a (let ((*random-state* (sb-ext:seed-random-state 20260906)))
-             (bl::seed-eviction-netgroup-key)))
+             (bl:seed-eviction-netgroup-key)))
         (b (let ((*random-state* (sb-ext:seed-random-state 20260906)))
-             (bl::seed-eviction-netgroup-key))))
+             (bl:seed-eviction-netgroup-key))))
     (is-true (and (consp a) (consp b)))
     (is (/= (car a) (car b))
         "two starts of one build drew the same first netgroup word (~D)" (car a))
@@ -727,7 +742,7 @@ same build. The keys must still differ."
 load-time draw survived unnoticed for as long as it did, and the pass is
 worthless with a key an attacker can guess -- so a node whose wiring is
 dropped must stop, not protect a predictable four."
-  (let ((bl::*eviction-netgroup-key* nil))
+  (let ((bl:*eviction-netgroup-key* nil))
     (signals bl.err:internal-error (%netgroup-key "10.0"))))
 
 (test eviction-netgroup-keying-does-not-cluster-by-prefix
@@ -739,7 +754,7 @@ adjacent values, so the highest-ranked netgroups -- the ones the pass protects
 attacker a whole neighbourhood of winners rather than one address at a time.
 
 Deterministic: the key is fixed, so the ranking is."
-  (let ((bl::*eviction-netgroup-key* (cons 1 2)))
+  (let ((bl:*eviction-netgroup-key* (cons 1 2)))
     (let ((top (%top-netgroups #'%netgroup-key 12)))
       (is (>= (%distinct-first-octets top) 8)
           "the 12 highest-ranked netgroups fall in only ~D /8~:P (~{~A ~}): the ~

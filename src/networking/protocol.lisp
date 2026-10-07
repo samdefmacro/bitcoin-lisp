@@ -2679,16 +2679,20 @@ elicit more than one reply regardless of whether we had addresses to send."
 
 (defun peer-connected-through-network (peer)
   "The network of the transport PEER is actually connected over (Core
-CNode::ConnectedThroughNetwork): :torv3 for peers accepted on the local
-onion-service listener (whose socket address is Tor's 127.0.0.1) and for
-outbound dials to .onion targets; otherwise the network of the peer's
-address, or :unroutable when it cannot be typed (hostname addnode)."
+CNode::ConnectedThroughNetwork, net.cpp:602-605: m_inbound_onion ? NET_ONION
+: addr.GetNetClass()): :torv3 for peers accepted on the local onion-service
+listener (whose socket address is Tor's 127.0.0.1); otherwise the CLASS of
+the peer's address -- :unroutable for one that is not publicly routable
+(10.0.0.1, 127.0.0.1), :ipv4 for an IPv6 address carrying an IPv4 one --
+or :unroutable when it cannot be typed (hostname addnode). The class keys
+the getaddr response cache (net.cpp:1832-1836) and drives GetLocal's privacy
+rule; the reachability rank reads the peer's own network instead (see
+GET-LOCAL-ADDR-FOR-PEER)."
   (if (peer-inbound-onion peer)
       :torv3
       (multiple-value-bind (net bytes)
           (parse-network-address (peer-address peer))
-        (declare (ignore bytes))
-        (or net :unroutable))))
+        (if net (address-net-class net bytes) :unroutable))))
 
 (defun peer-addr-local (peer)
   "The address PEER says it sees us at -- the addr_recv of the version message
@@ -2725,7 +2729,8 @@ above LOCAL_MANUAL): an inbound peer's report whole, an outbound one's IP
 only, keeping our port, since the peer cannot observe our listening port on a
 connection we opened. Whichever address results is advertised only if
 routable."
-  (let ((la (best-local-address (peer-connected-through-network peer))))
+  (let ((la (best-local-address (peer-connected-through-network peer)
+                                (or (parse-network-address (peer-address peer)) :unroutable))))
     (when (and (%peer-addr-local-good-p peer)
                (or (null la)
                    (not (address-publicly-routable-p (local-address-bytes la)

@@ -268,6 +268,31 @@ returns 0."
           (is (not (equalp (group u1) (group u2)))
               "unmapped addresses collapsed into one group"))))))
 
+(test an-asmap-file-that-fails-the-sanity-check-is-refused
+  "Core's DecodeAsmap runs CheckStandardAsmap -- SanityCheckAsmap over 128
+bits (util/asmap.cpp:239-343) -- and init refuses a map that fails it with
+`Could not parse asmap file' (init.cpp:1602-1606). Ours loaded any non-empty
+file, so a truncated or corrupt map was used: the interpreter's EOF and
+straddle cases answered 0 and the node bucketed whatever came out. Core's
+own test map passes; one byte of DEFAULT whose ASN runs off the end does not.
+Found writing the asmap fuzz targets."
+  (is-true (bl.net:asmap-sane-p (bl.crypto:hex-to-bytes +core-asmap-test-data+) 128)
+           "control: Core's own test map is sane")
+  (let ((path (merge-pathnames (format nil "bl-insane-asmap-~D" (get-internal-real-time))
+                               (uiop:temporary-directory)))
+        (bl.net:*asmap* nil))
+    (unwind-protect
+         (progn
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede)
+             (write-sequence #(#xff) out))
+           (is (equal (format nil "Could not parse asmap file \"~A\"" (namestring path))
+                      (handler-case (progn (bl.net:load-asmap-file path) "loaded")
+                        (error (e) (princ-to-string e))))
+               "a map whose DEFAULT's ASN runs off the end was loaded")
+           (is (null bl.net:*asmap*) "the refused map was installed"))
+      (ignore-errors (delete-file path)))))
+
 (test asmap-file-loading-is-fatal-on-failure
   "Core aborts startup on a missing or empty asmap file (init.cpp:1587-1600).
 Silently keeping /16 bucketing would leave exactly the eclipse exposure the
@@ -716,6 +741,8 @@ names the AS behind NET_IPV6 with the ASN least significant byte first
   (let* ((bl.net:*asmap* (bl.crypto:hex-to-bytes +core-functional-asmap-raw+))
          (asns (loop for b below 4
                      collect (bl.net:asmap-asn (bl.net:ipv4-to-mapped-ipv6 101 b 0 0) :ipv4))))
+    (is-true (bl.net:asmap-sane-p bl.net:*asmap* 128)
+             "Core's functional-test map must pass the load-time sanity check")
     (is (notany #'null asns) "every one of the four is mapped: ~S" asns)
     (is (= 3 (length (remove-duplicates asns))) "three ASes: ~S" asns)
     (let ((asn (first asns))

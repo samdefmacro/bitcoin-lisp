@@ -37,6 +37,21 @@ little-endian byte order (Core stores/compares hashes this way)."
 
 ;;; --- Bit stream + Golomb-Rice round-trips (implementation-internal) ---
 
+(test a-truncated-filter-is-a-stream-failure
+  "Core's BitStreamReader::Read refills from a SpanReader that throws
+std::ios_base::failure at the end of the data (streams.h:281-300), so a filter
+whose Golomb-Rice stream ends early is a stream failure. Ours read past the
+last byte and signalled an array-index error. Found by the golomb_rice fuzz
+target's undecodable half (golomb_rice.cpp:70-86)."
+  (let ((element (coerce #(1 2 3) '(simple-array (unsigned-byte 8) (*)))))
+    (is-false (bl.store:gcs-filter-match-any
+               (bl.store:build-gcs-filter (list element) 1 2) 1 2
+               (list (coerce #(9) '(simple-array (unsigned-byte 8) (*)))))
+              "control: a whole filter answers")
+    (signals bl.err:serialization-error
+      (bl.store:gcs-filter-match-any (coerce #(5 255) '(simple-array (unsigned-byte 8) (*)))
+                                     1 2 (list element)))))
+
 (test gcs-bitstream-roundtrip
   "Bits written MSB-first read back identically across byte boundaries."
   (let ((w (bl.store::%make-gcs-writer)))

@@ -9325,6 +9325,32 @@ address, and a malformed signature all fail. The signature is deterministic."
       (bl.rpc:dispatch-rpc-method node "verifymessage"
                                   (list addr "not-a-valid-sig" msg)))))
 
+(test verifymessage-reads-the-header-and-the-base64-as-core-does
+  "Core's MessageVerify decodes the signature with DecodeBase64
+(util/strencodings.cpp:109-142), which refuses a last character carrying bits
+past the last byte, and RecoverCompact (pubkey.cpp:300-304) reads only the
+header's low three bits. Ours decoded with cl-base64, which ignores those
+bits, and refused any header outside 27-34: one signature Core calls malformed
+verified true, one Core verifies was false. Found by the message fuzz target."
+  (let* ((node (make-test-node))
+         (key (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
+         (msg "Core reads three bits of the header")
+         (addr (bl.crypto:encode-p2pkh-address (bl.crypto:hash160 (bl.crypto:derive-public-key key)) :testnet3))
+         (sig (bl.rpc:dispatch-rpc-method node "signmessagewithprivkey"
+                                          (list (bl.crypto:private-key-to-wif key :network :testnet3) msg)))
+         (bytes (bl.ser:decode-base64 sig))
+         (alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"))
+    (is (eq t (bl.rpc:dispatch-rpc-method node "verifymessage" (list addr sig msg))) "control")
+    (setf (aref bytes 0) (+ 8 (aref bytes 0)))
+    (is (eq t (bl.rpc:dispatch-rpc-method node "verifymessage"
+                                          (list addr (bl.ser:encode-base64 bytes) msg)))
+        "the header moved by 8 is the same signature")
+    (let ((loose (concatenate 'string (subseq sig 0 (- (length sig) 2))
+                              (string (char alphabet (logior 1 (position (char sig (- (length sig) 2)) alphabet))))
+                              "=")))
+      (signals-rpc-error (:code -3 :exact-message "Malformed base64 encoding")
+        (bl.rpc:dispatch-rpc-method node "verifymessage" (list addr loose msg))))))
+
 (test rpc-verifymessage-p2sh-address-is-not-a-key
   "verifymessage refuses a P2SH address with Core's -3 `Address does not refer
 to key' instead of answering false. Core's MessageVerify asks DecodeDestination

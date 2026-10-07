@@ -1107,7 +1107,11 @@
   addrman FAILURE may be charged -- because inbound connections are free
   for an attacker to make; the inbound eviction reserve likewise protects
   each disadvantaged network's LONGEST-connected peers, which is what
-  \"precludes attacks that start later\" means. An inbound ONION peer is
+  \"precludes attacks that start later\" means. Every eviction pass compares
+  as Core's does, tie-breaks included, and the block-relay-only pass protects
+  the inbound peers that asked for no transactions in their VERSION and
+  offer the services we want -- our side of an inbound connection always
+  relays, so it is the PEER's fRelay the pass reads. An inbound ONION peer is
   granted no -whitelist permission by its address, because the address is
   not its own: every one of them arrives from the local Tor daemon on the
   onion listener, so one loopback range would hand the operator's trusted-peer

@@ -111,7 +111,10 @@ scriptPubKey, redeem script or witness script gets."
     ("hex" . ,(bl.crypto:bytes-to-hex script))))
 
 (defun %psbt-keypath-json (pubkey value)
-  "A bip32_derivs entry from a PUBKEY and a <fingerprint:4><path:4le*> VALUE."
+  "A bip32_derivs entry from a PUBKEY and a <fingerprint:4><path:4le*> VALUE.
+The path is Core's WriteHDKeypath with its default apostrophe=false
+(util/bip32.cpp:51-65, rawtransaction.cpp:1194, :1296, :1415, :1447): a
+hardened step is marked `h', as in m/48h/1h."
   `(("pubkey" . ,(bl.crypto:bytes-to-hex pubkey))
     ("master_fingerprint" . ,(bl.crypto:bytes-to-hex (subseq value 0 4)))
     ("path" . ,(with-output-to-string (s)
@@ -119,7 +122,7 @@ scriptPubKey, redeem script or witness script gets."
                  (loop for i from 4 below (length value) by 4
                        for el = (loop for j below 4 sum (ash (aref value (+ i j)) (* 8 j)))
                        do (if (>= el #x80000000)
-                              (format s "/~D'" (- el #x80000000))
+                              (format s "/~Dh" (- el #x80000000))
                               (format s "/~D" el)))))))
 
 (defun %psbt-sighash-name (n)

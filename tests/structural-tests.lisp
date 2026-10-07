@@ -1728,7 +1728,7 @@ name here.")
 keys or sighashes wants bl.bytes:make-octets-hash-table"
         now +equalp-hash-table-ceiling+)))
 
-(defparameter +test-internal-reference-ceiling+ 3546
+(defparameter +test-internal-reference-ceiling+ 3536
   "How many package-qualified INTERNAL references (a :: token) the files of
 the tests system may contain. The count is measured over the declared test
 files (%test-system-files), never a glob. History, so a reader can see what
@@ -1758,7 +1758,10 @@ fuzz-mempool batch: its thirty-odd mempool-side targets reach four internals
 (the SFL diagram, the tx-request tracker's in-flight count, the mini-miner's
 entry and comparator), and exporting the SFL, orphanage, fee-bucket and
 mempool-accounting entry points its targets drive -- each with its src
-caller -- gave older reaches one colon. White-box tests reaching
+caller -- gave older reaches one colon. 3,536 with the Round 12 fuzz batch,
+whose thirty-one targets reach nothing internal, and which gave ten older
+reaches one colon: the eviction selectors it exported (each with its src
+caller) and names their package already exported. White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
 GROW, and the shared fixtures in tests/support/ bring it down where the
 same internal was reached from a copy of the same helper in several files.

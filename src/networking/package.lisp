@@ -478,6 +478,7 @@ headerssync.cpp. src/networking/.")
    #:load-asmap-file
    #:asmap-version
    #:asmap-interpret
+   #:asmap-sane-p
    #:asmap-asn
    ;; Net permissions (-whitelist / -whitebind)
    #:parse-permission-flags
@@ -604,6 +605,15 @@ headerssync.cpp. src/networking/.")
    #:peer-connected-at
    #:peer-connection
    #:peer-headers-sync
+   ;; HeadersSyncState (headers-sync.lisp), for the headers_sync_state fuzz target
+   #:make-headers-sync
+   #:hss-process-next-headers
+   #:hss-locator-hashes
+   #:hss-state
+   #:hss-commitment-period
+   #:hss-redownload-buffer-size
+   #:hss-commit-offset
+   #:claimed-headers-work
    #:peer-id
    #:peer-inflight-block-hashes
    #:peer-last-ping-time
