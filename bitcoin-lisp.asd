@@ -706,6 +706,8 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/message")
                              (:file "fuzz/signet")
                              (:file "fuzz/integer")
+                             (:file "fuzz/asmap-direct")
+                             (:file "fuzz/asmap")
                              (:file "fuzz/p2p-headers-presync")
                              (:file "fuzz/connman")
                              (:file "fuzz/p2p-handshake")
