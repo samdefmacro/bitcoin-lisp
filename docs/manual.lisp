@@ -814,6 +814,16 @@
   the header), a received body stays VALID_TRANSACTIONS after pruning, pruning
   takes a body out of `*blocks-unlinked*` (DROP-UNLINKED-BLOCK) and start-up
   puts the waiting ones back (LINK-UNLINKED-BODIES, LoadBlockIndex's half).
+  A datadir migrated from this tree's pre-nTx header index can hold entries
+  with nTx 0 where Core's would have a count. LOAD-HEADER-INDEX names both
+  kinds once. Those that still hold a body get it back at start-up:
+  BACKFILL-TX-COUNTS reads the CompactSize after each body's header from its
+  blk file and writes the records in batches, resumable after a stop request
+  (the end state is Core's: CBlockIndex::nTx set with the body). Those that
+  were connected and have since been PRUNED have no body to read: nothing can
+  backfill them, the check refuses them (VALID_TRANSACTIONS iff nTx > 0), and
+  -checkblockindex cannot be enabled on that datadir until they are
+  downloaded again.
   BL.VAL:CHECK-BLOCK-INDEX samples it and runs it where Core does.
 
   A store has TWO bases. `base-path` is the network data directory and
@@ -872,6 +882,7 @@
   (bitcoin-lisp.storage:note-block-position function)
   (bitcoin-lisp.storage:drop-unlinked-block function)
   (bitcoin-lisp.storage:link-unlinked-bodies function)
+  (bitcoin-lisp.storage:backfill-tx-counts function)
   (bitcoin-lisp.storage:coin-view-get function)
   (bitcoin-lisp.storage:disconnect-block-from-utxo-set function)
   (bitcoin-lisp.storage:save-utxo-set function)

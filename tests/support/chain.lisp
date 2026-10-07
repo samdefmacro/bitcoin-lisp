@@ -392,3 +392,16 @@ header whose proof of work is not what gets it refused."
                  (1+ (bl.ser:block-header-nonce header))
                  (bl.ser:block-header-cached-hash header) nil))
   header)
+
+;;;; A body for a synthetic block-index entry (the check-block-index suite, the
+;;;; block_index_tree fuzz target)
+
+(defun %cbi-received (entry position &key undo)
+  "Give ENTRY a body at POSITION of blk file 0 and one transaction, and with
+UNDO an undo record too -- what storing (and connecting) its block records."
+  (setf (bl.store:block-index-entry-file entry) 0
+        (bl.store:block-index-entry-data-pos entry) position
+        (bl.store:block-index-entry-tx-count entry) 1)
+  (when undo
+    (setf (bl.store:block-index-entry-undo-pos entry) position))
+  entry)

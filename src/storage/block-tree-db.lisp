@@ -769,7 +769,33 @@ headers for."
              (values nil reason)
              (progn
                (setf (chain-state-block-index state) table)
+               (%report-bodies-without-tx-count table)
                (values t nil))))))))
+
+(defun %report-bodies-without-tx-count (table)
+  "Say once, at load, which entries of TABLE record no transaction count
+(nTx = 0) where Core's would: those that hold a body (HAVE_DATA), which
+BACKFILL-TX-COUNTS reads back from the block files next, and those that were
+connected (:valid) and have since been pruned, whose count left with the body.
+The header index this tree kept before nTx was stored wrote both. Core never
+holds either state -- ReceivedBlockTransactions sets nTx with the body
+(validation.cpp:3812) and pruning keeps it -- and its CheckBlockIndex refuses
+both (:5276/:5280, :5289); ours stops the node at the first. Returns (values
+HELD PRUNED)."
+  (let ((held 0) (pruned 0))
+    (maphash (lambda (hash entry)
+               (declare (ignore hash))
+               (when (zerop (block-index-entry-tx-count entry))
+                 (cond ((block-index-entry-data-pos entry) (incf held))
+                       ((eq (block-index-entry-status entry) :valid) (incf pruned)))))
+             table)
+    (when (plusp held)
+      (bl.log:log-info "LoadBlockIndex: ~D block~:P with a body but no transaction count (nTx = 0), written by the header index before nTx was kept; reading their counts from the block files"
+                       held))
+    (when (plusp pruned)
+      (bl.log:log-info "LoadBlockIndex: ~D pruned block~:P with no transaction count (nTx = 0) and no body to read one from; -checkblockindex cannot be enabled on this datadir until they are downloaded again"
+                       pruned))
+    (values held pruned)))
 
 (defun read-block-tree-file-info (base-path)
   "Core LoadBlockIndexDB's file-info read (node/blockstorage.cpp:535-552): the
