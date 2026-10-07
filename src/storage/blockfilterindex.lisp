@@ -185,19 +185,25 @@ next file (the old one truncated to its data and synced) when it would pass
 (defun %bfi-read-filter (bfi pos filter-hash)
   "Core ReadFilterFromDisk (blockfilterindex.cpp:151-174): the encoded filter
 at POS, or NIL when it cannot be read or its double SHA-256 is not
-FILTER-HASH (`Checksum mismatch in filter decode')."
-  (ignore-errors
-   (with-flat-file (in (blockfilterindex-fltr-seq bfi) pos :read-only t)
-     (let ((head (make-array 41 :element-type '(unsigned-byte 8))))
-       (let ((n (read-sequence head in)))
-         (when (> n 32)
-           (let* ((br (bl.ser:make-byte-reader-from (subseq head 32 n)))
-                  (len (bl.ser:br-read-compact-size br))
-                  (filter (make-array len :element-type '(unsigned-byte 8))))
-             (file-position in (+ (flat-file-pos-pos pos) 32 (bl.ser:br-pos br)))
-             (read-sequence filter in)
-             (when (equalp (block-filter-hash filter) filter-hash)
-               filter))))))))
+FILTER-HASH. Both failures are logged in Core's words (:165, :171)."
+  (handler-case
+      (with-flat-file (in (blockfilterindex-fltr-seq bfi) pos :read-only t)
+        (let* ((head (make-array 41 :element-type '(unsigned-byte 8)))
+               (n (read-sequence head in)))
+          (unless (> n 32)
+            (error "end of data"))
+          (let* ((br (bl.ser:make-byte-reader-from (subseq head 32 n)))
+                 (len (bl.ser:br-read-compact-size br))
+                 (filter (make-array len :element-type '(unsigned-byte 8))))
+            (file-position in (+ (flat-file-pos-pos pos) 32 (bl.ser:br-pos br)))
+            (unless (= len (read-sequence filter in))
+              (error "end of data"))
+            (if (equalp (block-filter-hash filter) filter-hash)
+                filter
+                (progn (bl.log:log-error "Checksum mismatch in filter decode.") nil)))))
+    (error (e)
+      (bl.log:log-error "Failed to deserialize block filter from disk: ~A" e)
+      nil)))
 
 ;;; --- lookups (Core index_util::LookUpOne) ---
 

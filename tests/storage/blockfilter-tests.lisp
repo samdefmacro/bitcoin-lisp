@@ -173,7 +173,8 @@ an unrelated script (almost surely) does not."
   "A regtest node at genesis with an enabled block filter index (fresh temp
 DB), genesis-anchored the way production startup leaves it: the initial
 backfill (catch-up-index -> index-sync -> build-blockfilterindex) indexes the
-genesis filter from chain parameters before any block connects."
+genesis filter from chain parameters before any block connects. The index's
+directory is the second value."
   (let* ((tag (format nil "bfi~D" (get-internal-real-time)))
          (node (regtest-node-fixture tag))
          (idxbase (merge-pathnames (format nil "test-bfi-~A/" tag)
@@ -186,7 +187,7 @@ genesis filter from chain parameters before any block connects."
      (bl:node-chain-state node)
      (bl:node-block-store node)
      #'bl.val:get-undo-data)
-    node))
+    (values node idxbase)))
 
 (defun %bfi-zeros32 ()
   (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
@@ -243,6 +244,36 @@ recomputation, and a filter header; unknown type / missing block error."
          (signals bl.rpc:rpc-error
            (bl.rpc::rpc-getblockfilter
             node (list (bl.rpc:hash-to-hex (%bfi-zeros32))))))))))
+
+(test a-filter-that-does-not-read-back-is-refused-in-cores-words
+  "Core ReadFilterFromDisk (blockfilterindex.cpp:151-174) refuses a stored
+filter whose hash is not the one its database record names, logging
+`Checksum mismatch in filter decode.', and one it cannot read, logging
+`Failed to deserialize block filter from disk'; LookupFilter then fails and
+getblockfilter answers as for an unindexed block. Ours refused both
+silently. The control: the untouched block's filter reads back."
+  (with-network (:regtest)
+    (multiple-value-bind (node idxbase) (%bfi-regtest-node)
+      (let ((bl:*node* node))
+        (let* ((hashes (mapcar #'bl.rpc:parse-hex-hash (generate-regtest-blocks node 2)))
+               (bfi (bl:node-blockfilterindex node))
+               (file (first (directory (merge-pathnames "**/fltr*.dat" idxbase)))))
+          (is-true (bl.store:blockfilterindex-get-filter bfi (first hashes) 1) "control")
+          ;; A record is the block hash, then the filter's CompactSize length
+          ;; and bytes: flip the last filter byte of block 2's record.
+          (let ((filter (bl.store:blockfilterindex-get-filter bfi (second hashes) 2)))
+            (with-open-file (io file :direction :io :if-exists :overwrite
+                                     :element-type '(unsigned-byte 8))
+              (let ((content (make-array (file-length io) :element-type '(unsigned-byte 8))))
+                (read-sequence content io)
+                (let ((at (+ (search (second hashes) content) 32 1 (length filter) -1)))
+                  (file-position io at)
+                  (write-byte (logxor (aref content at) #xff) io)))))
+          (let ((lines (capture-log-lines
+                        (lambda ()
+                          (is (null (bl.store:blockfilterindex-get-filter bfi (second hashes) 2)))))))
+            (is (find-if (lambda (l) (search "Checksum mismatch in filter decode." l)) lines)
+                "logged: ~S" lines)))))))
 
 (test blockfilterindex-header-chain
   "Each block's stored filter header chains off its parent's (BIP157)."
