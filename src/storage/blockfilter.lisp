@@ -63,7 +63,13 @@ single Write may transiently hold up to 64 bits before draining)."
   (bit-pos 0 :type fixnum))            ; 0 = most-significant bit of current byte
 
 (defun gcs-reader-read-bit (r)
-  "Read and return the next bit (0/1) from reader R, most-significant first."
+  "Read and return the next bit (0/1) from reader R, most-significant first.
+Past the last byte this is a stream failure, as Core's BitStreamReader::Read
+refills its buffer from a SpanReader that throws std::ios_base::failure at
+the end of the data (streams.h:281-300) -- a truncated filter is refused, not
+read out of bounds."
+  (when (>= (gcs-reader-byte-pos r) (length (gcs-reader-bytes r)))
+    (serialization-error "BitStreamReader: end of data"))
   (let* ((b (aref (gcs-reader-bytes r) (gcs-reader-byte-pos r)))
          (bit (logand (ash b (- (- 7 (gcs-reader-bit-pos r)))) 1)))
     (incf (gcs-reader-bit-pos r))
