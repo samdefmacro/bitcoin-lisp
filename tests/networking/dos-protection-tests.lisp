@@ -1725,10 +1725,7 @@ seven paths that clear the flag it was the only record of what happened.
 
 Both directions are asserted, so neither half can pass vacuously: absent at the
 default level, present with the net category on."
-  (let ((bl.log:*log-buffer* (make-array bl.log:+log-buffer-size+
-                                         :initial-element nil))
-        (bl.log:*log-buffer-index* 0)
-        (bl.log:*log-buffer-count* 0)
+  (let ((bl.log:*log-buffer* (bl.log:make-log-ring))
         (bl.log:*category-log-levels* (make-hash-table :test 'equal :synchronized t))
         (bl.log::*debug-categories* (make-hash-table :test 'equal))
         (bl.log:*current-log-level* :info)
@@ -1741,7 +1738,7 @@ default level, present with the net category on."
                (drain-peer-once peer (bl.ctx:make-node-context) nil)
                peer))
            (logged (needle)
-             (find-if (lambda (e) (and e (search needle e))) bl.log:*log-buffer*)))
+             (find-if (lambda (e) (search needle e)) (bl.log:log-ring-lines bl.log:*log-buffer*))))
       ;; A hard send failure -- a socket-less connection is one -- is Core's
       ;; \"socket send error\", and it is one of the five paths that log nothing
       ;; of their own.

@@ -404,6 +404,18 @@ and mutation is forbidden while a builder exists either way."
     (assert (= i (%chunk-index-count index)))
     out))
 
+(defun txgraph-map-chunks-in-order (graph function)
+  "Call FUNCTION on every chunk of GRAPH's main chunk index in mining order --
+%CHUNK-INDEX-VECTOR's walk without the vector, for a reader that visits each
+chunk once (the mempool's consistency check). GRAPH must not be mutated
+meanwhile."
+  (declare (type function function))
+  (let ((index (txgraph-chunk-index graph)))
+    (loop for node = (svref (%ci-node-next (%chunk-index-head index)) 0)
+            then (svref (%ci-node-next node) 0)
+          while node
+          do (funcall function (%ci-node-chunk node)))))
+
 (defun %chunk-index-full-rebuild (graph)
   "The chunk index computed from scratch: every cluster's chunks collected and
 sorted by %COMPARE-MAIN. This is what the index used to be recomputed by after

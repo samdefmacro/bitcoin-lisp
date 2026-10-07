@@ -51,8 +51,10 @@ Commands:
                      reporting only a real ERROR (a probe's benign redefinition
                      warning must not abort the load).
   eval FORM          Evaluate FORM in the warm image (via cl-workbench)
-  test NAME          Run one fiveam suite (raw designator, e.g. :script-tests)
-  test-all           Run the full :bitcoin-lisp-tests suite (long)
+  test NAME          Run one fiveam suite (raw designator, e.g. :script-tests);
+                     refuses to run while ghost-check finds ghosts
+                     (DEV_ALLOW_GHOSTS=1 runs anyway)
+  test-all           Run the full :bitcoin-lisp-tests suite (long); same refusal
   docs-check         Verify PAX documentation transcripts in a cold container
   ghost-check        Fail (rc 1) naming every definition the warm image holds
                      that the source no longer has -- a deleted or renamed
@@ -382,6 +384,18 @@ ghost_check_form() {
   printf '(progn (load "/workspace/scripts/ghost-check.lisp") (uiop:symbol-call :bl-ghost-check :report :signal %s))' "$1"
 }
 
+# A warm suite run is exactly what a ghost makes untrustworthy, so `test' and
+# `test-all' run the check first and refuse to run over one.
+# DEV_ALLOW_GHOSTS=1 runs the suite anyway.
+require_no_ghosts() {
+  [[ "${DEV_ALLOW_GHOSTS:-0}" = 1 ]] && return 0
+  if ! ghost_check >&2; then
+    echo "ERROR: the warm image holds definitions the source does not have (above);" >&2
+    echo "       fmakunbound them or restart the image (DEV_ALLOW_GHOSTS=1 runs anyway)." >&2
+    return 1
+  fi
+}
+
 ghost_check() {
   DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-120}" \
   DEV_EVAL_MAX_OUTPUT="${DEV_EVAL_MAX_OUTPUT:-100000}" \
@@ -512,6 +526,7 @@ test_one() {
     echo "test requires one fiveam suite designator, e.g. :script-tests" >&2
     return 2
   fi
+  require_no_ghosts || return 1
   local suite; suite=$(suite_designator "$1")
   DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-600}" \
   DEV_EVAL_MAX_OUTPUT="${DEV_EVAL_MAX_OUTPUT:-400000}" \
@@ -522,6 +537,7 @@ test_one() {
 }
 
 test_all() {
+  require_no_ghosts || return 1
   DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-3600}" \
   DEV_EVAL_MAX_OUTPUT="${DEV_EVAL_MAX_OUTPUT:-400000}" \
     eval_form '(let ((r (fiveam:run :bitcoin-lisp-tests)))

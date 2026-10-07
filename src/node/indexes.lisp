@@ -221,8 +221,7 @@ below the pruned horizon; the index needs genesis-contiguous history)"
       n)))
 
 (defparameter +index-thread-specials+
-  '(*node* bl.chain:*network* bl.log:*log-stream* bl.log:*log-buffer*
-    bl.log:*log-buffer-index* bl.log:*log-buffer-count*)
+  '(*node* bl.chain:*network* bl.log:*log-stream* bl.log:*log-buffer*)
   "The specials an index's sync thread takes over from the thread that starts
 it: a thread sees only GLOBAL values, and a caller that binds the node or the
 log destination (a test, an in-image restart) means those.")
