@@ -1,4 +1,52 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(cl-workbench:*)",
+      "Bash(scripts/dev.sh:*)",
+      "Bash(./scripts/dev.sh:*)",
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git blame:*)",
+      "Bash(git describe:*)",
+      "Bash(git remote -v:*)",
+      "Bash(git fetch:*)",
+      "Bash(git stash list:*)",
+      "Bash(git worktree list:*)",
+      "Bash(git tag -l:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git switch:*)",
+      "Bash(docker ps:*)",
+      "Bash(docker images:*)",
+      "Bash(docker inspect:*)",
+      "Bash(docker logs:*)",
+      "Bash(docker volume ls:*)",
+      "Bash(docker network ls:*)",
+      "Bash(docker compose ls:*)",
+      "Bash(docker version:*)",
+      "Bash(docker info:*)",
+      "Bash(rg:*)",
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run view:*)",
+      "Bash(scripts/hoodi-live-gate.sh:*)",
+      "Bash(ssh test-ethereum-sophon2-symbiosis:*)",
+      "Bash(scripts/dev.sh status *)"
+
+    ]
+  },
   "hooks": {
     "PostToolUse": [
       {

@@ -8,7 +8,7 @@ S="ssh -o ConnectTimeout=20 -o BatchMode=yes test-bitcoin-server"
 $S "cat /data/bitcoin-lisp/logs/soak.tsv" | python3 -c '
 import sys, datetime
 days=float(sys.argv[1])
-cut=datetime.datetime.utcnow()-datetime.timedelta(days=days)
+cut=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)-datetime.timedelta(days=days)
 rows=[l.rstrip("\n").split("\t") for l in sys.stdin if l.strip()]
 def et(s):
     if "-" in s: d,rest=s.split("-"); 
@@ -30,9 +30,9 @@ for net in ("testnet4","mainnet"):
         lag=[x[0] for x in ok if int(x[4])-int(x[3])>2]
         if lag: print(f"  behind headers by >2 at: {lag}")
     restarts=[r[i][0] for i in range(1,len(r)) if r[i][8]!="no-process" and r[i-1][8]!="no-process" and et(r[i][8])<et(r[i-1][8])]
-    print(f"  restarts: {restarts or 'none'}")
+    print(f"  restarts: {restarts or "none"}")
     errs=[(r[i][0], int(r[i][9])-int(r[i-1][9])) for i in range(1,len(r)) if r[i][9].isdigit() and r[i-1][9].isdigit() and int(r[i][9])>int(r[i-1][9])]
-    print(f"  new [error] lines: {errs or 'none'}")
+    print(f"  new [error] lines: {errs or "none"}")
     reorgs=[(r[i][0], int(r[i][11])-int(r[i-1][11])) for i in range(1,len(r)) if r[i][11].isdigit() and r[i-1][11].isdigit() and int(r[i][11])>int(r[i-1][11])]
-    print(f"  reorg mentions: {reorgs or 'none'}")
+    print(f"  reorg mentions: {reorgs or "none"}")
 ' "$DAYS"
