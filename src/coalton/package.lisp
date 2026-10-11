@@ -383,6 +383,8 @@
    #:*script-flags*
    #:set-script-flags
    #:flag-enabled-p
+   ;; Script tracing: NIL in production, bound by an inspector on its thread
+   #:*script-trace-hook*
    ;; Signature verification
    #:verify-script
    #:p2sh-redeem-script
@@ -452,6 +454,7 @@
    ;; Tapscript / BIP 342
    #:*tapscript-leaf-hash*
    #:*tapscript-amount*
+   #:*tapscript-validation-weight-left*
    #:verify-tapscript-signature
    #:is-op-success-p
    #:scan-for-op-success

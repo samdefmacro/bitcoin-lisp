@@ -558,6 +558,9 @@ bitcoin-cli (node-main)."
                              (:file "validation/merkle-tests")
                              ;; Bitcoin Core BIP 341 taproot test vectors
                              (:file "coalton/bitcoin-core-bip341-tests")
+                             ;; The script trace hook; uses the helpers of the script,
+                             ;; tx, sighash and BIP 341 suites, all loaded above
+                             (:file "coalton/script-trace-hook-tests")
                                (:file "crypto/bitcoin-core-vector-tests")
                              (:file "crypto/bitcoin-core-key-io-tests")
                              (:file "mempool/block-policy-estimator-tests")

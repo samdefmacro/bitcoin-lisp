@@ -497,32 +497,48 @@ into the current one."
 The flag-dependent ENCODING checks run FIRST, before the cache is consulted —
 Core's CheckSignatureEncoding sits inside CheckECDSASignature, ahead of the
 caching VerifyECDSASignature. That ordering is what lets MAKE-SIG-CACHE-KEY
-carry no script flags; see the note there."
+carry no script flags; see the note there.
+
+Every return reports a :SIGCHECK event to *SCRIPT-TRACE-HOOK*, the cache hit
+included. The CHECKSIG paths run their own encoding check before the sighash
+(CHECK-CHECKSIG-ENCODINGS), so a signature that fails it never gets here."
   (multiple-value-bind (encoding-ok encoding-status)
       (bl.crypto:check-signature-encoding der-sig :strict strict :low-s low-s)
     (unless encoding-ok
+      (when *script-trace-hook*
+        (%trace-sigcheck :ecdsa sighash der-sig pubkey-bytes nil encoding-status nil))
       (return-from cached-verify-ecdsa (values nil encoding-status))))
   (let ((cache-key (when *signature-cache-enabled*
                      (make-sig-cache-key #x45 sighash der-sig pubkey-bytes))))
     (when (and cache-key (sig-cache-hit-p cache-key (not *signature-cache-store*)))
+      (when *script-trace-hook*
+        (%trace-sigcheck :ecdsa sighash der-sig pubkey-bytes t t t))
       (return-from cached-verify-ecdsa (values t t)))
     (multiple-value-bind (result status)
         (bl.crypto:verify-signature sighash der-sig pubkey-bytes
                                               :strict strict :low-s low-s)
       (when (and result cache-key *signature-cache-store*)
         (sig-cache-store cache-key))
+      (when *script-trace-hook*
+        (%trace-sigcheck :ecdsa sighash der-sig pubkey-bytes result status nil))
       (values result status))))
 
 (defun cached-verify-schnorr (sighash sig64 pubkey-bytes)
-  "Verify Schnorr signature with caching. Returns T/NIL."
+  "Verify Schnorr signature with caching. Returns T/NIL.
+Every return reports a :SIGCHECK event to *SCRIPT-TRACE-HOOK*, the cache hit
+included; a Schnorr signature has no status, so :STATUS is NIL."
   (let ((cache-key (when *signature-cache-enabled*
                      (make-sig-cache-key #x53 sighash sig64 pubkey-bytes))))
     (when (and cache-key (sig-cache-hit-p cache-key (not *signature-cache-store*)))
+      (when *script-trace-hook*
+        (%trace-sigcheck :schnorr sighash sig64 pubkey-bytes t nil t))
       (return-from cached-verify-schnorr t))
     (let ((result (bl.crypto:verify-schnorr-signature
                    sighash sig64 pubkey-bytes)))
       (when (and result cache-key *signature-cache-store*)
         (sig-cache-store cache-key))
+      (when *script-trace-hook*
+        (%trace-sigcheck :schnorr sighash sig64 pubkey-bytes result nil nil))
       result)))
 
 
@@ -799,8 +815,12 @@ and is an ordinary P2SH spend, not a witness program.
 Evaluates SCRIPT-SIG alone (push-only under P2SH, so no tx context is
 needed) and returns the top element as a byte vector, or NIL when the
 evaluation fails or leaves the stack empty — which the caller reads as
-\"not a witness program\"."
-  (multiple-value-bind (ok stack) (run-script script-sig)
+\"not a witness program\".
+
+That evaluation is ours, not one of the EvalScripts VerifyScript runs, so it is
+hidden from *SCRIPT-TRACE-HOOK*: a traced P2SH spend shows Core's three frames."
+  (multiple-value-bind (ok stack) (let ((*script-trace-hook* nil))
+                                    (run-script script-sig))
     (when (and ok (consp stack))
       (coalton-vector-to-cl-array (car stack)))))
 
@@ -1460,7 +1480,11 @@ Used for the SIGPUSHONLY flag and for BIP16's push-only scriptSig rule."
                 (write-u32-le 0 s)
                 ;; Sighash type (4 bytes LE)
                 (write-u32-le (logand sighash-type #xff) s))))
-        (bl.crypto:hash256 preimage)))))
+        (let ((digest (bl.crypto:hash256 preimage)))
+          (when *script-trace-hook*
+            (%trace-sighash :legacy sighash-type preimage digest
+                            :input-index 0 :subscript subscript :script-code subscript))
+          digest)))))
 
 ;;; ============================================================
 ;;; Legacy Sighash for Real Block Validation
@@ -1649,8 +1673,12 @@ encoded it separately and disagreed above 75 bytes."
    SUBSCRIPT is the scriptCode (scriptPubKey or redeemScript).
    SIGHASH-TYPE is the sighash type byte (last byte of signature).
 
-   This implements BIP 66 / original Bitcoin sighash algorithm."
-  (let* ((subscript (remove-codeseparator subscript))
+   This implements BIP 66 / original Bitcoin sighash algorithm.
+
+   Reports a :SIGHASH event to *SCRIPT-TRACE-HOOK*, with SUBSCRIPT as passed
+   and as serialized (its OP_CODESEPARATORs removed)."
+  (let* ((passed-subscript subscript)
+         (subscript (remove-codeseparator subscript))
          (base-type (logand sighash-type #x1f))
          (anyone-can-pay (not (zerop (logand sighash-type #x80))))
          (inputs (bl.ser:transaction-inputs tx))
@@ -1661,10 +1689,14 @@ encoded it separately and disagreed above 75 bytes."
     ;; Special case: SIGHASH_SINGLE with input-index >= num-outputs
     ;; Returns hash of all 1s (Bitcoin's bug/feature)
     (when (and (= base-type 3) (>= input-index num-outputs))
-      (return-from compute-legacy-sighash
-        (make-array 32 :element-type '(unsigned-byte 8)
-                       :initial-contents '(1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0))))
+      (let ((one (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-contents '(1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                                                    0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0))))
+        ;; Nothing is hashed: the digest is the constant, the preimage NIL.
+        (when *script-trace-hook*
+          (%trace-sighash :legacy sighash-type nil one :input-index input-index
+                          :subscript passed-subscript :script-code subscript))
+        (return-from compute-legacy-sighash one)))
 
     ;; Hot path on stress blocks. Build the preimage in a direct byte-buf
     ;; instead of routing every byte through flexi-streams' Gray-stream
@@ -1745,7 +1777,11 @@ encoded it separately and disagreed above 75 bytes."
                (bb-write-u32-le bb sighash-type)
                (bb-finish bb))))
 
-      (bl.crypto:hash256 preimage))))
+      (let ((digest (bl.crypto:hash256 preimage)))
+        (when *script-trace-hook*
+          (%trace-sighash :legacy sighash-type preimage digest :input-index input-index
+                          :subscript passed-subscript :script-code subscript))
+        digest))))
 
 ;;; ============================================================
 ;;; BIP 143 Sighash (SegWit)
@@ -1908,7 +1944,14 @@ output carrying the credited AMOUNT forward, with an empty scriptPubKey
       (setf pos (buf-set-u32-le preimage pos
                                 (bl.ser:transaction-lock-time tx)))
       (setf pos (buf-set-u32-le preimage pos sighash-type))
-      (bl.crypto:hash256 (subseq preimage 0 pos)))))
+      ;; The buffer is sized for the largest varint; the event gets the very
+      ;; octets that are hashed, not the buffer.
+      (let* ((hashed (subseq preimage 0 pos))
+             (digest (bl.crypto:hash256 hashed)))
+        (when *script-trace-hook*
+          (%trace-sighash :bip143 sighash-type hashed digest
+                          :script-code script-code :amount amount))
+        digest))))
 
 (defun compute-bip143-sighash-test (script-code amount sighash-type)
   "Compute BIP 143 sighash using synthetic credit transaction (script_tests.json format)."
@@ -1941,7 +1984,11 @@ output carrying the credited AMOUNT forward, with an empty scriptPubKey
               (loop for b across hash-outputs do (write-byte b s))
               (write-u32-le 0 s)
               (write-u32-le sighash-type s))))
-      (bl.crypto:hash256 preimage))))
+      (let ((digest (bl.crypto:hash256 preimage)))
+        (when *script-trace-hook*
+          (%trace-sighash :bip143 sighash-type preimage digest
+                          :script-code script-code :amount amount))
+        digest))))
 
 (defun valid-sighash-type-p (sighash-type)
   "Check if sighash type is valid.
@@ -3193,6 +3240,11 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
   (when (and (= (logand sighash-type #x1f) 3)
              (>= *current-input-index*
                  (length (bl.ser:transaction-outputs *current-tx*))))
+    (when *script-trace-hook*
+      (%trace-sighash :bip341 sighash-type nil nil
+                      :tapleaf-hash tapleaf-hash :key-version key-version
+                      :annex *current-annex*
+                      :codesep-opcode-index *tapscript-codesep-pos*))
     (return-from compute-bip341-sighash-real nil))
   (let* ((tx *current-tx*)
          (input-index *current-input-index*)
@@ -3315,7 +3367,16 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
                                    "nil")
                                pos
                                (bl.crypto:bytes-to-hex (subseq preimage 0 pos))))
-      (bl.crypto:tagged-hash "TapSighash" (subseq preimage 0 pos)))))
+      ;; Epoch byte and SigMsg, the octets the tagged hash reads; the buffer
+      ;; itself is sized for the longest message.
+      (let* ((hashed (subseq preimage 0 pos))
+             (digest (bl.crypto:tagged-hash "TapSighash" hashed)))
+        (when *script-trace-hook*
+          (%trace-sighash :bip341 sighash-type hashed digest
+                          :tapleaf-hash tapleaf-hash :key-version key-version
+                          :annex *current-annex*
+                          :codesep-opcode-index *tapscript-codesep-pos*))
+        digest))))
 
 (defun compute-bip341-sighash-test (amount sighash-type &optional tapleaf-hash key-version)
   "Compute BIP 341 signature hash using a synthetic credit transaction.
@@ -3434,5 +3495,12 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
                 (write-byte (or key-version 0) s)
                 ;; codesep_pos (4 bytes, 0xffffffff = no CODESEPARATOR)
                 (write-u32-le #xffffffff s)))))
-      ;; Return TapSighash
-      (bl.crypto:tagged-hash "TapSighash" preimage))))
+      ;; Return TapSighash. The event names what this preimage commits to: no
+      ;; annex, and the constant codesep_pos above.
+      (let ((digest (bl.crypto:tagged-hash "TapSighash" preimage)))
+        (when *script-trace-hook*
+          (%trace-sighash :bip341 sighash-type preimage digest
+                          :tapleaf-hash tapleaf-hash :key-version key-version
+                          :annex nil :codesep-opcode-index #xffffffff
+                          :amount amount))
+        digest))))

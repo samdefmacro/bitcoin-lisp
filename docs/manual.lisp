@@ -1651,7 +1651,63 @@
   need the mapping from bytes to meaning to be one to one. That is also
   why `classify-script' reads the bare-multisig counts through
   GetScriptNumber rather than through the OP_1..OP_16 range: 17 through
-  20 have no OP_n opcode and reach Core only as a minimal push."
+  20 have no OP_n opcode and reach Core only as a minimal push.
+
+  The script trace hook, `*script-trace-hook*' (bridge.lisp, beside
+  `*script-flags*'), is NIL in production. An inspector that loads the
+  system as a library LET-binds it to a function on its own thread and
+  validates one input; the hook is then called as (funcall hook EVENT
+  &rest PLIST), synchronously and in execution order, so a CHECKSIG reads
+  :STEP, :SIGHASH, :SIGCHECK, then the next :STEP. A condition the hook
+  signals reaches the caller of verify-script unchanged. The binding is
+  thread-local, so a parallel script-check worker never sees it. Events:
+  :FRAME-BEGIN on entering `execute-script-with-stack-tx', before any
+  check (:SCRIPT, :INITIAL-STACK top first, :SIGVERSION one of :BASE,
+  :WITNESS-V0, :TAPSCRIPT); :STEP at the top of every interpreter
+  iteration, before the next opcode is read, the iteration that finds the
+  script finished included, so a push in a skipped branch is reported with
+  :EXECUTING NIL (:POSITION and :CODESEP-BYTE-POS are byte offsets, the
+  latter 0 until an executed OP_CODESEPARATOR moves it to the byte after
+  itself -- Core's pbegincodehash, which legacy and witness v0 sighashes
+  cut their scriptCode from; :OPCODE-INDEX is Core's opcode_pos; :OP-COUNT,
+  :COND-DEPTH, :MAIN-STACK, :ALT-STACK; :VALIDATION-WEIGHT-LEFT is the
+  tapscript sigops budget, NIL outside a tapscript); :FRAME-END on every
+  return (:OK, then :STACK, or :ERROR as `script-error-name' spells it);
+  :SIGHASH from every signature-hash function (:KIND :LEGACY, :BIP143 or
+  :BIP341, :HASH-TYPE, :PREIMAGE exactly the octets hashed -- the BIP 341
+  epoch byte included -- :DIGEST, and the function's own arguments: legacy
+  :INPUT-INDEX, :SUBSCRIPT as passed and :SCRIPT-CODE as serialized; BIP
+  143 :SCRIPT-CODE and :AMOUNT; BIP 341 :TAPLEAF-HASH, :KEY-VERSION,
+  :ANNEX and :CODESEP-OPCODE-INDEX, Core's m_codeseparator_pos, whose
+  #xFFFFFFFF means none was executed and which a key path always carries;
+  the script_tests.json BIP 341 variant adds :AMOUNT); :SIGCHECK from both caching
+  verifiers (:ALGORITHM :ECDSA or :SCHNORR, :DIGEST, :SIGNATURE, :PUBKEY,
+  :RESULT, :STATUS -- the ECDSA second value, NIL for Schnorr -- and
+  :CACHED). Stack elements and :SCRIPT are Coalton vectors, every other
+  byte field an octet vector; scalars are copied out of the mutable
+  context, and the stacks are immutable lists, so an event may be kept. A
+  legacy SIGHASH_SINGLE past the outputs hashes nothing (:PREIMAGE NIL,
+  :DIGEST Core's constant 1); a BIP 341 one has no digest at all (both
+  NIL). Re-hashing under another hash type from inside a :SIGHASH event
+  goes through the exported `compute-legacy-sighash', `compute-bip143-sighash'
+  and `compute-bip341-sighash' with the hook bound to NIL: the event is
+  sent while the computation's bindings are still in force.
+
+  Every input runs its scriptSig and its scriptPubKey as two :BASE frames;
+  a P2SH spend adds its redeem script, and under WITNESS a P2WSH or
+  P2SH-P2WSH spend its witness script and, under TAPROOT, a script-path
+  spend its tapscript. The scriptSig re-run inside p2sh-redeem-script is
+  ours, not one of VerifyScript's EvalScripts, and is hidden from the hook.
+  Two kinds of outcome send no event of their own; where one is a failure,
+  the error keyword verify-script returns names it. No frame: the checks
+  verify-script makes before any script runs (SIGPUSHONLY,
+  CONST_SCRIPTCODE's pre-scan), the witness checks made before EvalScript
+  (program length, witness script hash, element size and count, control
+  block, an OP_SUCCESS tapscript), and the P2WPKH and key paths, which
+  never reach EvalScript. No :SIGCHECK: a signature rejected
+  before the cryptographic verify -- an empty one, a FindAndDelete
+  rejection, an encoding failure in `check-checksig-encodings', a Schnorr
+  size or hash type failure, an undefined BIP 341 digest."
   (bitcoin-lisp.coalton.script package)
   (bitcoin-lisp.coalton.interop package)
   (bitcoin-lisp.coalton.script:script-error-name function)
@@ -1661,6 +1717,8 @@
   (bitcoin-lisp.coalton.interop:script-error-for-keyword function)
   (bitcoin-lisp.coalton.interop:script-error-name function)
   (bitcoin-lisp.coalton.interop:script-error-message function)
+  (bitcoin-lisp.coalton.interop:*script-trace-hook* variable)
+  (bitcoin-lisp.coalton.interop:*tapscript-validation-weight-left* variable)
   (bitcoin-lisp.validation:execute-script function)
   (bitcoin-lisp.validation:validate-input-script function)
   (bitcoin-lisp.validation:classify-script function)

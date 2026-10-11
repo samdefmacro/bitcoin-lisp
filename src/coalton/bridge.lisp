@@ -152,3 +152,46 @@ token set, as the string alone would answer it."
 (define-compiler-macro flag-enabled-p (&whole form flag)
   (let ((bit (and (stringp flag) (script-flag-bit flag))))
     (if bit `(script-flag-bit-p ,bit) form)))
+
+;;; ============================================================
+;;; Script tracing
+;;; ============================================================
+;;;
+;;; An inspector process that loads this system as a library binds
+;;; *SCRIPT-TRACE-HOOK* on its own thread and validates one input; the
+;;; interpreter and the signature paths report what they do as events, so a
+;;; trace is a by-product of the consensus engine rather than a second
+;;; interpreter. It lives here, beside *SCRIPT-FLAGS*, because the interpreter
+;;; reads it on every step and this file loads before script.lisp. The manual's
+;;; script section is the contract for every event and field.
+
+(defvar *script-trace-hook* nil
+  "NIL in production. When bound to a function, the script interpreter and
+the signature paths call it as (funcall hook EVENT &rest PLIST), on the binding
+thread, synchronously and in execution order: :FRAME-BEGIN and :FRAME-END
+around every EvalScript, :STEP at the top of every interpreter iteration,
+:SIGHASH from every signature-hash function, :SIGCHECK from both caching
+verifiers. Bind it with LET, never SETF: a parallel script-check worker must
+not see it. A condition the hook signals reaches the caller of VERIFY-SCRIPT
+unchanged.")
+
+#+sbcl (declaim (sb-ext:always-bound *script-trace-hook*))
+(declaim (type (or null function) *script-trace-hook*))
+
+(defun %trace-sighash (kind hash-type preimage digest &rest fields)
+  "Report one signature hash to *SCRIPT-TRACE-HOOK* as a :SIGHASH event.
+PREIMAGE is exactly the octets that were hashed (NIL where nothing was), DIGEST
+the result (NIL where none is defined); FIELDS are the computing function's own
+arguments, as the manual lists them per KIND. Callers test the hook first, so
+an unbound hook allocates nothing."
+  (apply *script-trace-hook* :sighash :kind kind :hash-type hash-type
+         :preimage preimage :digest digest fields))
+
+(defun %trace-sigcheck (algorithm digest signature pubkey result status cached)
+  "Report one signature verification to *SCRIPT-TRACE-HOOK* as a :SIGCHECK
+event: what a caching verifier was asked, what it answered (RESULT, and for
+ECDSA the STATUS second value), and whether the answer came from the cache.
+Callers test the hook first."
+  (funcall *script-trace-hook* :sigcheck :algorithm algorithm :digest digest
+           :signature signature :pubkey pubkey :result result :status status
+           :cached cached))
