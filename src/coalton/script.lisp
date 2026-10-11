@@ -38,6 +38,25 @@
 
 #+sbcl (cl:declaim (sb-ext:freeze-type script-context-data))
 
+;;; The :STEP event of bl.interop:*script-trace-hook*, sent by
+;;; EXECUTE-SCRIPT-LOOP before it reads the next opcode. The context is updated
+;;; in place after this returns, so every scalar is read here; the two stacks
+;;; are immutable lists and go out as they are. The tapscript budget is not in
+;;; the context: VALIDATE-TAPROOT-SCRIPT-PATH binds it around the execution, and
+;;; interop.lisp, which defines it, loads after this file.
+(cl:defun %trace-step (ctx)
+  (cl:funcall bl.interop:*script-trace-hook* :step
+              :position (script-context-data-position ctx)
+              :opcode-index (script-context-data-opcode-pos ctx)
+              :op-count (script-context-data-op-count ctx)
+              :executing (cl:= -1 (script-context-data-first-false-pos ctx))
+              :cond-depth (script-context-data-cond-stack-size ctx)
+              :main-stack (script-context-data-main-stack ctx)
+              :alt-stack (script-context-data-alt-stack ctx)
+              :codesep-byte-pos (script-context-data-codesep-pos ctx)
+              :validation-weight-left
+              (cl:symbol-value 'bl.interop:*tapscript-validation-weight-left*)))
+
 (coalton-toplevel
 
   ;;; ============================================================
@@ -2416,11 +2435,22 @@ a consensus split."
 
   (declare execute-script-loop (ScriptContext -> (ScriptResult ScriptStack)))
   (define (execute-script-loop ctx)
-    "Main execution loop for script processing."
+    "Main execution loop for script processing.
+
+With bl.interop:*script-trace-hook* bound, every iteration opens with a :STEP
+event, before the next opcode is read -- the iteration that finds the script
+finished included -- so a push in a skipped branch is reported as well as an
+executed opcode. Nothing may follow the recursive calls below, and nothing may
+wrap them in a dynamic binding or a handler: they are tail calls, and an
+unbounded tapscript depends on it."
     (let ((pos (context-position ctx))
           (script (context-script ctx))
           (len (the UFix (coalton-library/vector:length script)))
           (exec (context-executing ctx)))
+      (lisp Unit (ctx)
+        (cl:progn
+          (cl:when bl.interop:*script-trace-hook* (%trace-step ctx))
+          Unit))
       (if (>= pos len)
           ;; Script finished - check for unbalanced conditionals
           (if (context-conditions-empty-p ctx)
@@ -2591,7 +2621,65 @@ context)."
   (declare execute-script-with-stack-tx ((Vector U8) -> ScriptStack -> U32 -> I32 -> U32 -> SigVersion -> (ScriptResult ScriptStack)))
   (define (execute-script-with-stack-tx script initial-stack locktime version sequence sigversion)
     "Core's EvalScript (interpreter.cpp:407): run SCRIPT over INITIAL-STACK
-under SIGVERSION, with transaction context."
+under SIGVERSION, with transaction context.
+
+With bl.interop:*script-trace-hook* bound, the execution is one trace frame:
+:FRAME-BEGIN before any check, :FRAME-END with the result on every return. That
+path calls EVAL-SCRIPT as a non-tail call -- one more stack frame per traced
+script, never per opcode. Unbound, it is the tail call it always was."
+    (if (lisp Boolean () (cl:not (cl:null bl.interop:*script-trace-hook*)))
+        (progn
+          (trace-frame-begin script initial-stack sigversion)
+          (let ((result (eval-script script initial-stack locktime version sequence sigversion)))
+            (trace-frame-end result)
+            result))
+        (eval-script script initial-stack locktime version sequence sigversion)))
+
+  (declare sigversion-trace-name (SigVersion -> String))
+  (define (sigversion-trace-name sv)
+    "SV as the trace hook's :SIGVERSION keyword spells it."
+    (match sv
+      ((SigVersionBase) "BASE")
+      ((SigVersionWitnessV0) "WITNESS-V0")
+      ((SigVersionTaproot) "TAPROOT")
+      ((SigVersionTapscript) "TAPSCRIPT")))
+
+  (declare trace-frame-begin ((Vector U8) -> ScriptStack -> SigVersion -> Unit))
+  (define (trace-frame-begin frame-script frame-stack sigversion)
+    "The trace hook's :FRAME-BEGIN event: the script, the stack it starts on
+(top first), and its SigVersion as :BASE, :WITNESS-V0 or :TAPSCRIPT."
+    (let ((sv-name (sigversion-trace-name sigversion)))
+      (lisp Unit (frame-script frame-stack sv-name)
+        (cl:progn
+          (cl:funcall bl.interop:*script-trace-hook* :frame-begin
+                      :script frame-script
+                      :initial-stack frame-stack
+                      :sigversion (cl:intern sv-name "KEYWORD"))
+          Unit))))
+
+  (declare trace-frame-end ((ScriptResult ScriptStack) -> Unit))
+  (define (trace-frame-end result)
+    "The trace hook's :FRAME-END event: :OK, and either the final stack or the
+Core error name SCRIPT-ERROR-NAME gives the failure."
+    (match result
+      ((ScriptOk end-stack)
+       (lisp Unit (end-stack)
+         (cl:progn
+           (cl:funcall bl.interop:*script-trace-hook* :frame-end
+                       :ok cl:t :stack end-stack)
+           Unit)))
+      ((ScriptErr e)
+       (let ((err-name (script-error-name e)))
+         (lisp Unit (err-name)
+           (cl:progn
+             (cl:funcall bl.interop:*script-trace-hook* :frame-end
+                         :ok cl:nil :error err-name)
+             Unit))))))
+
+  (declare eval-script ((Vector U8) -> ScriptStack -> U32 -> I32 -> U32 -> SigVersion -> (ScriptResult ScriptStack)))
+  (define (eval-script script initial-stack locktime version sequence sigversion)
+    "The body of EXECUTE-SCRIPT-WITH-STACK-TX, shared by its traced and
+untraced paths."
     (let ((len (the UFix (coalton-library/vector:length script))))
       ;; MAX_SCRIPT_SIZE binds BASE and WITNESS_V0 only; BIP 342 removes it
       ;; for tapscript (interpreter.cpp:428).
