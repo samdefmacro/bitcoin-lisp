@@ -27,6 +27,13 @@
 # Usage:
 #   scripts/run-node.sh <network>          # network: testnet4 | mainnet | regtest
 #
+# Over ssh, start it detached with the WHOLE command redirected:
+#   setsid nohup bash /data/bitcoin-lisp/code/scripts/run-node.sh testnet4 \
+#     >> /data/bitcoin-lisp/logs/testnet4-supervisor.out 2>&1 < /dev/null &
+# not as `cd DIR && setsid nohup ... &`: the `&` then backgrounds the whole &&
+# list as a subshell whose own stdout/stderr are still the ssh channel, and it
+# waits on the supervisor, so the ssh call never returns.
+#
 # Override any default via environment, e.g.:
 #   BL_DATA_ROOT=/srv/btc BL_SBCL=/opt/sbcl/bin/sbcl scripts/run-node.sh testnet4
 #   BL_MAX_FAST_FAILURES=5 BL_HEALTHY_RUN_SECONDS=300   # exit-1 backoff policy
