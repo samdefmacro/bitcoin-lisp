@@ -41,6 +41,19 @@
 # coins-prefetch and pool work does not address. Do not set it on mainnet until
 # testnet4 has run clean for a long stretch.
 #
+# BL_RPC_AUTH and BL_RPC_WHITELIST add ONE more RPC account, meant for a service
+# that must not hold the cookie (the cookie is an admin credential):
+#   BL_RPC_AUTH='viz:<salt>$<hmac>'                   # share/rpcauth/rpcauth.py viz
+#   BL_RPC_WHITELIST='viz:getblockcount,getblock,...' # what it may call, no spaces
+# Set both or neither; with neither, the node starts exactly as before. The
+# account always comes with :rpc-whitelist-default nil: Core's default lets one
+# -rpcwhitelist lock out every user that has none, __cookie__ included, and
+# bitcoin-cli and the web UI with it. The credentials stay out of the checkout:
+# when neither variable is set, BL_RPC_ENV_FILE (default
+# $BL_ROOT/secrets/rpc-<network>.env, single-quoted assignments) is sourced if
+# it exists, so a relaunch keeps the account without anyone exporting it. Move
+# that file aside and restart to drop the account.
+#
 set -euo pipefail
 
 # The network is REQUIRED: the CLI defaults to mainnet, as Core does, and a
@@ -83,7 +96,14 @@ case "$NETWORK" in
     # blk?????.dat instead of one file per block; the existing per-block files
     # stay readable (dual read), and turning the flag back off leaves the flat
     # records readable too, so this is reversible in both directions.
-    START_OPTS=':blockfilterindex t :v2transport t :coinstatsindex t :txindex t :flat-block-files t' ;;
+    # -txospenderindex and -rest serve the bitcoin-viz product: gettxspendingprevout
+    # finds a CONFIRMED spender only through that index, and REST serves raw
+    # blocks and their spent outputs. REST answers without credentials, as in
+    # Core, so the RPC port must stay on start-node's 127.0.0.1 default. Unlike
+    # Core, start-up WAITS for every index to catch up: a first start with an
+    # index, or one after its directory is removed, builds it from genesis before
+    # the node syncs or answers RPC (-28 until then).
+    START_OPTS=':blockfilterindex t :v2transport t :coinstatsindex t :txindex t :txospenderindex t :rest t :flat-block-files t' ;;
   mainnet)
     HEAP=5120; RPC_PORT=8332
     DATA_DIR="$BL_DATA_ROOT/mainnet-prune/"; LOG="$BL_LOG_ROOT/mainnet.log"
@@ -104,6 +124,37 @@ case "$NETWORK" in
     echo "run-node.sh: unknown network '$NETWORK' (want testnet4|mainnet|regtest)" >&2
     exit 2 ;;
 esac
+
+# --- The optional extra RPC account (see the header) -------------------------
+BL_RPC_ENV_FILE="${BL_RPC_ENV_FILE:-$BL_ROOT/secrets/rpc-$NETWORK.env}"
+RPC_SOURCE='the environment'
+if [ -z "${BL_RPC_AUTH:-}${BL_RPC_WHITELIST:-}" ] && [ -f "$BL_RPC_ENV_FILE" ]; then
+  . "$BL_RPC_ENV_FILE"
+  RPC_SOURCE="$BL_RPC_ENV_FILE"
+fi
+RPC_OPTS=''
+RPC_ACCOUNT='none, cookie only'
+if [ -n "${BL_RPC_AUTH:-}${BL_RPC_WHITELIST:-}" ]; then
+  # The patterns also keep both values safe inside the Lisp strings below: no
+  # quote, no backslash. The HMAC must be lowercase hex, the form the node
+  # compares an offered password's digest against.
+  auth_re='^([A-Za-z0-9_.-]+):[0-9a-f]+[$][0-9a-f]+$'
+  list_re='^([A-Za-z0-9_.-]+):[a-z0-9_]+(,[a-z0-9_]+)*$'
+  if ! [[ ${BL_RPC_AUTH:-} =~ $auth_re ]]; then
+    echo "run-node.sh: BL_RPC_AUTH must be USER:SALT\$HMAC in lowercase hex, as share/rpcauth/rpcauth.py prints it" >&2
+    exit 2
+  fi
+  rpc_user="${BASH_REMATCH[1]}"
+  # A whitelist naming another user would leave this one without any -- and so,
+  # under :rpc-whitelist-default nil, free to call every method.
+  if ! [[ ${BL_RPC_WHITELIST:-} =~ $list_re ]] || [ "${BASH_REMATCH[1]}" != "$rpc_user" ]; then
+    echo "run-node.sh: BL_RPC_WHITELIST must be $rpc_user:method,method,... with no spaces; without it $rpc_user could call every method" >&2
+    exit 2
+  fi
+  IFS=, read -ra rpc_methods <<< "${BL_RPC_WHITELIST#*:}"
+  RPC_OPTS=":rpc-auth (list \"$BL_RPC_AUTH\") :rpc-whitelist (list \"$BL_RPC_WHITELIST\") :rpc-whitelist-default nil"
+  RPC_ACCOUNT="$rpc_user with ${#rpc_methods[@]} methods, from $RPC_SOURCE"
+fi
 
 export SBCL_HOME="$BL_SBCL_HOME"
 export LD_LIBRARY_PATH="$BL_SECP_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -129,6 +180,7 @@ if [ "$GITREV" != "unknown" ] && [ "$PREV_REV" != "$GITREV" ]; then
 fi
 
 echo "[$NETWORK-supervisor] up at $(date) heap=${HEAP}MiB rpc=$RPC_PORT rev=$GITREV data=$DATA_DIR"
+echo "[$NETWORK-supervisor] extra RPC account: $RPC_ACCOUNT"
 echo "[$NETWORK-supervisor] NOTE: a defstruct change needs the FASL cache cleared;"
 echo "[$NETWORK-supervisor]       this script auto-clears it on a git-rev change. If"
 echo "[$NETWORK-supervisor]       you edit without committing, clear manually:"
@@ -152,7 +204,7 @@ while true; do
     --eval "(bitcoin-lisp.serialization::stamp-build-git-rev \"$GITREV\")" \
     --eval "(setf bitcoin-lisp:*network* :$NETWORK)" \
     ${BL_PAR:+--eval "(bitcoin-lisp::apply-config-globals (list (cons \"par\" \"$BL_PAR\")))"} \
-    --eval "(bitcoin-lisp:start-node :data-directory \"$DATA_DIR\" :network :$NETWORK :rpc-port $RPC_PORT $START_OPTS :log-file \"$LOG\")" \
+    --eval "(bitcoin-lisp:start-node :data-directory \"$DATA_DIR\" :network :$NETWORK :rpc-port $RPC_PORT $START_OPTS${RPC_OPTS:+ $RPC_OPTS} :log-file \"$LOG\")" \
     --eval '(bitcoin-lisp:run-node-watchdog)'
   code=$?
   set -e
