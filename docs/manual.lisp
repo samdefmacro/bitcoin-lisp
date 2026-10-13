@@ -1703,8 +1703,13 @@
   verify-script makes before any script runs (SIGPUSHONLY,
   CONST_SCRIPTCODE's pre-scan), the witness checks made before EvalScript
   (program length, witness script hash, element size and count, control
-  block, an OP_SUCCESS tapscript), and the P2WPKH and key paths, which
-  never reach EvalScript. No :SIGCHECK: a signature rejected
+  block, an OP_SUCCESS tapscript), the key path, which Core never runs
+  through EvalScript either, and P2WPKH -- there the trace and Core part:
+  Core builds `OP_DUP OP_HASH160 <program> OP_EQUALVERIFY OP_CHECKSIG' and
+  runs it as a WITNESS_V0 EvalScript (interpreter.cpp:1942), while
+  `validate-p2wpkh' decides the same spend natively, so a traced P2WPKH
+  spend has no WITNESS-V0 frame and no :STEP, only its :SIGHASH and its
+  :SIGCHECK. No :SIGCHECK: a signature rejected
   before the cryptographic verify -- an empty one, a FindAndDelete
   rejection, an encoding failure in `check-checksig-encodings', a Schnorr
   size or hash type failure, an undefined BIP 341 digest."

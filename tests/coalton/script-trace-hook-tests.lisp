@@ -393,8 +393,10 @@ witness script, a script-path spend its tapscript."
     (is (equal '(:base :base :tapscript) (th-sigversions events)))))
 
 (test the-p2wpkh-and-key-paths-have-no-frame-of-their-own
-  "P2WPKH and the Taproot key path never reach EvalScript: only the two BASE
-frames appear, then the signature hash and the verification."
+  "Neither P2WPKH nor the Taproot key path reaches our interpreter -- Core runs
+P2WPKH's implied P2PKH script through EvalScript, validate-p2wpkh decides it
+natively -- so only the two BASE frames appear, then the signature hash and the
+verification."
   (multiple-value-bind (tx utxo) (th-p2wpkh-spend)
     (multiple-value-bind (events ok) (th-trace-input tx utxo)
       (is (eq t ok))
@@ -876,7 +878,10 @@ untraced, while the binding thread's own run is traced."
                      (lambda ()
                        (handler-case (multiple-value-list (run-script-test "1" "1" "P2SH"))
                          (error (e) (list :error (princ-to-string e))))))))
-        (setf thread-answer (bt:join-thread thread)))
+        ;; A hung run must fail the test, not the battery: SB-THREAD's join
+        ;; takes the timeout bordeaux-threads v1's does not.
+        (setf thread-answer (sb-thread:join-thread thread :default '(:timed-out)
+                                                          :timeout 30)))
       (is (zerop events) "the other thread's run reached the hook ~D times" events)
       (is (eq t (first (multiple-value-list (run-script-test "1" "1" "P2SH")))))
       (is (plusp events) "the binding thread's own run must reach the hook"))

@@ -500,8 +500,10 @@ caching VerifyECDSASignature. That ordering is what lets MAKE-SIG-CACHE-KEY
 carry no script flags; see the note there.
 
 Every return reports a :SIGCHECK event to *SCRIPT-TRACE-HOOK*, the cache hit
-included. The CHECKSIG paths run their own encoding check before the sighash
-(CHECK-CHECKSIG-ENCODINGS), so a signature that fails it never gets here."
+and the encoding rejection below included (:RESULT NIL, :STATUS the encoding
+status). Both CHECKSIG callers run CHECK-CHECKSIG-ENCODINGS before the sighash,
+so a signature that fails it never gets here from them; the check below is the
+defence for any other caller, and it reports like every other return."
   (multiple-value-bind (encoding-ok encoding-status)
       (bl.crypto:check-signature-encoding der-sig :strict strict :low-s low-s)
     (unless encoding-ok
@@ -1425,9 +1427,15 @@ Used for the SIGPUSHONLY flag and for BIP16's push-only scriptSig rule."
   "Compute the sighash for Bitcoin Core test transaction format.
    This matches the standardized transaction structure used in script_tests.cpp.
    SUBSCRIPT is the script to use as scriptCode in the sighash (redeemScript for P2SH).
-   The credit transaction uses *original-script-pubkey* if set, for P2SH support."
+   The credit transaction uses *original-script-pubkey* if set, for P2SH support.
+
+   The scriptCode is serialized as Core's SerializeScriptCode does, its
+   OP_CODESEPARATORs dropped (interpreter.cpp, CTransactionSignatureSerializer),
+   and the :SIGHASH event reports SUBSCRIPT as passed and the scriptCode as
+   serialized, like COMPUTE-LEGACY-SIGHASH."
   ;; For P2SH, credit tx must use original P2SH scriptPubKey, not the redeemScript
-  (let ((credit-script (or *original-script-pubkey* subscript)))
+  (let ((credit-script (or *original-script-pubkey* subscript))
+        (script-code (remove-codeseparator subscript)))
     ;; Build the credit transaction hash first
     (let* ((credit-tx-data
              (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
@@ -1466,8 +1474,8 @@ Used for the SIGPUSHONLY flag and for BIP16's push-only scriptSig rule."
                 (loop for b across credit-txid do (write-byte b s))
                 (write-u32-le 0 s)  ; vout = 0
                 ;; Input: scriptCode (subscript = redeemScript for P2SH, scriptPubKey otherwise)
-                (write-varint (length subscript) s)
-                (loop for b across subscript do (write-byte b s))
+                (write-varint (length script-code) s)
+                (loop for b across script-code do (write-byte b s))
                 ;; Input: sequence
                 (write-u32-le #xffffffff s)
                 ;; Output count
@@ -1483,7 +1491,7 @@ Used for the SIGPUSHONLY flag and for BIP16's push-only scriptSig rule."
         (let ((digest (bl.crypto:hash256 preimage)))
           (when *script-trace-hook*
             (%trace-sighash :legacy sighash-type preimage digest
-                            :input-index 0 :subscript subscript :script-code subscript))
+                            :input-index 0 :subscript subscript :script-code script-code))
           digest)))))
 
 ;;; ============================================================
@@ -2799,7 +2807,12 @@ validation layer's solver and policy alike."
    WITNESS is list of (signature pubkey).
    PROGRAM is the 20-byte keyhash.
    AMOUNT is the input value in satoshis.
-   Returns (values success error-keyword)."
+   Returns (values success error-keyword).
+
+   Core runs this spend as a WITNESS_V0 EvalScript of the implied P2PKH
+   script (interpreter.cpp:1942-1943); this function decides it natively, so
+   a traced P2WPKH spend opens no frame for *SCRIPT-TRACE-HOOK* and sends no
+   :STEP, only the :SIGHASH and :SIGCHECK of its CHECKSIG."
   ;; Witness must have exactly 2 elements. Core reports
   ;; WITNESS_PROGRAM_MISMATCH for any other count, including zero
   ;; (interpreter.cpp:1938-1940 "2 items in witness").
